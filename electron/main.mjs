@@ -79,6 +79,17 @@ function createWindow() {
   })
 
   window.once('ready-to-show', () => window.show())
+  window.webContents.on('did-fail-load', (_event, code, description, url) => {
+    console.error('[renderer:load]', { code, description, url })
+  })
+  window.webContents.on('preload-error', (_event, preloadPath, error) => {
+    console.error('[renderer:preload]', { preloadPath, error })
+  })
+  window.webContents.on('console-message', (_event, details) => {
+    if (details.level === 'warning' || details.level === 'error') {
+      console.error('[renderer:console]', details)
+    }
+  })
   window.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith('https://')) shell.openExternal(url)
     return { action: 'deny' }

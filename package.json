@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "description": "Desktop agent operating system for crypto trading",
+  "author": "guoyuxin33",
   "main": "electron/main.mjs",
   "type": "module",
   "scripts": {
@@ -43,6 +44,7 @@
     "productName": "Atlas Agent OS",
     "asar": true,
     "directories": {
+      "buildResources": "build",
       "output": "release"
     },
     "files": [
@@ -52,6 +54,7 @@
     ],
     "mac": {
       "category": "public.app-category.finance",
+      "icon": "build/icon.icns",
       "target": ["dmg", "zip"],
       "artifactName": "Atlas-Agent-OS-${version}-${arch}.${ext}"
     },

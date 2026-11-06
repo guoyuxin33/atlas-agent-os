@@ -8,3 +8,5 @@ release/
 !.env.example
 work/
 outputs/
+build/icon.iconset/
+build/icon-1024.png
