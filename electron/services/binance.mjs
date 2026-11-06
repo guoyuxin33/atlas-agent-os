@@ -23,6 +23,13 @@ const futuresPositionModeCaches = {
   testnet: { expiresAt: 0, value: 'ONE_WAY' },
   live: { expiresAt: 0, value: 'ONE_WAY' },
 }
+const serverTimeStates = new Map()
+const rateLimitStates = new Map()
+const pendingLiveOrders = new Map()
+const SERVER_TIME_TTL = 5 * 60 * 1000
+const SIGNED_RECV_WINDOW = 5000
+let binanceRequestFetcher = fetchWithProxy
+let networkRevision = 0
 let paperLoaded = false
 let paperLoadPromise = null
 let paperPersistQueue = Promise.resolve()
@@ -102,6 +109,118 @@ function apiBase(environment, marketType) {
     return environment === 'live' ? 'https://fapi.binance.com' : 'https://testnet.binancefuture.com'
   }
   return environment === 'live' ? 'https://api.binance.com' : 'https://testnet.binance.vision'
+}
+
+function serverTimeKey(environment, marketType) {
+  return `${environment}:${marketType}`
+}
+
+export function calculateServerTimeOffset(serverTime, startedAt, endedAt) {
+  const server = Number(serverTime)
+  const started = Number(startedAt)
+  const ended = Number(endedAt)
+  if (![server, started, ended].every(Number.isFinite) || ended < started) throw new Error('Binance server time response is invalid')
+  return Math.round(server - ((started + ended) / 2))
+}
+
+export function createSignedQuery(params, { timestamp, recvWindow = SIGNED_RECV_WINDOW, apiSecret }) {
+  if (!apiSecret) throw new Error('Binance API Secret is required')
+  if (!Number.isFinite(Number(timestamp))) throw new Error('Binance timestamp is invalid')
+  const query = new URLSearchParams()
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') query.set(key, String(value))
+  })
+  query.set('timestamp', String(Math.round(Number(timestamp))))
+  query.set('recvWindow', String(recvWindow))
+  query.set('signature', createHmac('sha256', apiSecret).update(query.toString()).digest('hex'))
+  return query
+}
+
+async function synchronizeServerTime(environment, marketType, force = false) {
+  const key = serverTimeKey(environment, marketType)
+  const existing = serverTimeStates.get(key)
+  if (!force && existing?.expiresAt > Date.now()) return existing.offset
+  if (existing?.request) return existing.request
+  assertRateLimitAvailable(environment, marketType)
+
+  const revision = networkRevision
+  const requestPromise = (async () => {
+    const startedAt = Date.now()
+    const timePath = marketType === 'futures' ? '/fapi/v1/time' : '/api/v3/time'
+    const response = await binanceRequestFetcher(`${apiBase(environment, marketType)}${timePath}`, { signal: AbortSignal.timeout(8000) })
+    const payload = await response.json().catch(() => null)
+    if (!response.ok || !Number.isFinite(Number(payload?.serverTime))) {
+      const blockedUntil = revision === networkRevision ? recordRateLimit(environment, marketType, response, payload) : null
+      const retryMessage = blockedUntil ? `，${Math.max(1, Math.ceil((blockedUntil - Date.now()) / 1000))} 秒后重试` : ''
+      throw new BinanceApiError(`${payload?.msg || `Binance 时间同步失败 (${response.status})`}${retryMessage}`, {
+        code: payload?.code,
+        status: response.status,
+        retryAfter: blockedUntil ? Math.max(1, Math.ceil((blockedUntil - Date.now()) / 1000)) : undefined,
+      })
+    }
+    const offset = calculateServerTimeOffset(payload.serverTime, startedAt, Date.now())
+    serverTimeStates.set(key, { offset, expiresAt: Date.now() + SERVER_TIME_TTL })
+    return offset
+  })()
+  serverTimeStates.set(key, { offset: existing?.offset || 0, expiresAt: 0, request: requestPromise })
+  try {
+    return await requestPromise
+  } catch (error) {
+    serverTimeStates.delete(key)
+    throw error
+  }
+}
+
+class BinanceApiError extends Error {
+  constructor(message, { code, status, retryAfter } = {}) {
+    super(message)
+    this.name = 'BinanceApiError'
+    this.code = code
+    this.status = status
+    this.retryAfter = retryAfter
+  }
+}
+
+function rateLimitKey(environment, marketType) {
+  return `${environment}:${marketType}`
+}
+
+function retryAfterTimestamp(response, payload) {
+  const retryAfter = response.headers.get('retry-after')
+  if (retryAfter) {
+    const seconds = Number(retryAfter)
+    if (Number.isFinite(seconds)) return Date.now() + Math.max(1, seconds) * 1000
+    const date = Date.parse(retryAfter)
+    if (Number.isFinite(date)) return date
+  }
+  const bannedUntil = String(payload?.msg || '').match(/banned until\s+(\d{10,13})/i)?.[1]
+  if (bannedUntil) {
+    const numeric = Number(bannedUntil)
+    return bannedUntil.length <= 10 ? numeric * 1000 : numeric
+  }
+  return Date.now() + (response.status === 418 || Number(payload?.code) === -1003 ? 5 * 60 * 1000 : 60 * 1000)
+}
+
+function recordRateLimit(environment, marketType, response, payload) {
+  if (![418, 429].includes(response.status) && Number(payload?.code) !== -1003) return null
+  const blockedUntil = retryAfterTimestamp(response, payload)
+  rateLimitStates.set(rateLimitKey(environment, marketType), blockedUntil)
+  return blockedUntil
+}
+
+function assertRateLimitAvailable(environment, marketType) {
+  const key = rateLimitKey(environment, marketType)
+  const blockedUntil = rateLimitStates.get(key) || 0
+  if (blockedUntil <= Date.now()) {
+    rateLimitStates.delete(key)
+    return
+  }
+  const retryAfterSeconds = Math.max(1, Math.ceil((blockedUntil - Date.now()) / 1000))
+  throw new BinanceApiError(`Binance 请求频率受限，本地已暂停 REST 请求，${retryAfterSeconds} 秒后重试 [-1003]`, {
+    code: -1003,
+    status: 429,
+    retryAfter: retryAfterSeconds,
+  })
 }
 
 export async function loadBinanceCredentials(environment) {
@@ -443,10 +562,13 @@ function paperPosition({ symbol, marketType, side, quantity, entryPrice, markPri
 
 async function paperTickerMap(marketType, options = {}) {
   let rows = []
-  try {
-    rows = await getLiveTickers(marketType)
-  } catch {
-    // Keep the last executable mark when Binance is temporarily unavailable.
+  const hasStreamMark = Boolean(options.symbol) && finiteNumber(options.markPrice) > 0
+  if (!hasStreamMark) {
+    try {
+      rows = await getLiveTickers(marketType)
+    } catch {
+      // Keep the last executable mark when Binance is temporarily unavailable.
+    }
   }
   const map = new Map(rows.map((ticker) => [ticker.symbol, finiteNumber(ticker.lastPrice)]))
   if (options.symbol && finiteNumber(options.markPrice) > 0) map.set(options.symbol, finiteNumber(options.markPrice))
@@ -582,11 +704,15 @@ async function matchPaperOrders(marketType, tickers) {
     if (!(markPrice > 0) || !isPaperOrderMarketable(order, markPrice)) continue
     try {
       const fillPrice = finiteNumber(order.price, markPrice)
-      if (marketType === 'futures') fillPaperFuturesOrder(order, fillPrice)
-      else fillPaperSpotOrder(order, fillPrice)
+      const execution = marketType === 'futures'
+        ? fillPaperFuturesOrder(order, fillPrice)
+        : fillPaperSpotOrder(order, fillPrice)
       order.status = 'FILLED'
       order.executedQty = String(order.quantity)
       order.avgPrice = String(fillPrice)
+      order.realizedPnl = String(execution.realizedPnl)
+      order.commission = '0'
+      order.commissionAsset = 'USDT'
       order.updateTime = Date.now()
     } catch (error) {
       order.status = 'REJECTED'
@@ -612,15 +738,17 @@ function fillPaperSpotOrder(order, fillPrice) {
     const entryPrice = ((existing?.entryPrice || 0) * currentQuantity + fillPrice * quantity) / nextQuantity
     account.usdt -= cost
     account.holdings.set(order.symbol, { symbol: order.symbol, asset, quantity: nextQuantity, entryPrice, markPrice: fillPrice })
-    return
+    return { realizedPnl: 0 }
   }
 
   if (!existing || quantity > existing.quantity + 1e-8) throw new Error(`模拟盘 ${asset} 可用余额不足`)
+  const realizedPnl = (fillPrice - existing.entryPrice) * quantity
   account.usdt += quantity * fillPrice
-  account.realizedPnl += (fillPrice - existing.entryPrice) * quantity
+  account.realizedPnl += realizedPnl
   const nextQuantity = existing.quantity - quantity
   if (nextQuantity <= 1e-10) account.holdings.delete(order.symbol)
   else account.holdings.set(order.symbol, { ...existing, quantity: nextQuantity, markPrice: fillPrice })
+  return { realizedPnl }
 }
 
 function paperFuturesOrderContext(order) {
@@ -657,6 +785,7 @@ function fillPaperFuturesOrder(order, fillPrice) {
   const configured = paperFuturesConfiguration(order.symbol)
   const previousWalletBalance = account.walletBalance
   const previousRealizedPnl = account.realizedPnl
+  let orderRealizedPnl = 0
 
   let entryPrice = existing?.entryPrice || fillPrice
   if (currentQuantity === 0 || Math.sign(currentQuantity) === Math.sign(orderQuantity)) {
@@ -664,9 +793,9 @@ function fillPaperFuturesOrder(order, fillPrice) {
     entryPrice = ((entryPrice * Math.abs(currentQuantity)) + (fillPrice * Math.abs(orderQuantity))) / nextAbsoluteQuantity
   } else {
     const closedQuantity = Math.min(Math.abs(currentQuantity), Math.abs(orderQuantity))
-    const realizedPnl = (fillPrice - entryPrice) * closedQuantity * Math.sign(currentQuantity)
-    account.realizedPnl += realizedPnl
-    account.walletBalance += realizedPnl
+    orderRealizedPnl = (fillPrice - entryPrice) * closedQuantity * Math.sign(currentQuantity)
+    account.realizedPnl += orderRealizedPnl
+    account.walletBalance += orderRealizedPnl
     if (Math.abs(orderQuantity) > Math.abs(currentQuantity)) entryPrice = fillPrice
   }
 
@@ -688,31 +817,70 @@ function fillPaperFuturesOrder(order, fillPrice) {
     }
     account.positions.set(positionKey, nextPosition)
   }
+  return { realizedPnl: orderRealizedPnl }
 }
 
 async function request({ environment, marketType, path, method = 'GET', params = {}, signed = false, credentials: credentialOverride }) {
+  const revision = networkRevision
+  assertRateLimitAvailable(environment, marketType)
   const credentials = credentialOverride || await loadBinanceCredentials(environment)
-  const query = new URLSearchParams()
-  Object.entries(params).forEach(([key, value]) => {
-    if (value !== undefined && value !== null && value !== '') query.set(key, String(value))
-  })
-
   const headers = {}
   if (signed) {
     if (!credentials?.apiKey || !credentials?.apiSecret) throw new Error('尚未配置 Binance API Key')
     if (credentials.environment && credentials.environment !== environment) {
       throw new Error(`当前凭证属于 ${credentials.environment === 'live' ? '生产' : '测试网'}，请重新配置所选环境`)
     }
-    query.set('timestamp', String(Date.now()))
-    query.set('recvWindow', '5000')
-    query.set('signature', createHmac('sha256', credentials.apiSecret).update(query.toString()).digest('hex'))
     headers['X-MBX-APIKEY'] = credentials.apiKey
   }
 
-  const response = await fetchWithProxy(`${apiBase(environment, marketType)}${path}?${query.toString()}`, { method, headers })
-  const data = await response.json().catch(() => null)
-  if (!response.ok) throw new Error(data?.msg || `Binance request failed (${response.status})`)
-  return data
+  let timeOffset = signed ? await synchronizeServerTime(environment, marketType) : 0
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const query = signed
+      ? createSignedQuery(params, { timestamp: Date.now() + timeOffset, apiSecret: credentials.apiSecret })
+      : new URLSearchParams(Object.entries(params).filter(([, value]) => value !== undefined && value !== null && value !== '').map(([key, value]) => [key, String(value)]))
+    const suffix = query.size ? `?${query.toString()}` : ''
+    const response = await binanceRequestFetcher(`${apiBase(environment, marketType)}${path}${suffix}`, { method, headers, signal: AbortSignal.timeout(10_000) })
+    const data = await response.json().catch(() => null)
+    if (response.ok) return data
+    const blockedUntil = revision === networkRevision ? recordRateLimit(environment, marketType, response, data) : null
+    if (signed && Number(data?.code) === -1021 && attempt === 0) {
+      timeOffset = await synchronizeServerTime(environment, marketType, true)
+      continue
+    }
+    const retryAfter = blockedUntil
+      ? Math.max(1, Math.ceil((blockedUntil - Date.now()) / 1000))
+      : response.headers.get('retry-after')
+    const codeSuffix = data?.code !== undefined ? ` [${data.code}]` : ''
+    const retrySuffix = blockedUntil ? `；本地已暂停 REST 请求，${retryAfter} 秒后重试` : ''
+    throw new BinanceApiError(`${data?.msg || `Binance request failed (${response.status})`}${codeSuffix}${retrySuffix}`, {
+      code: data?.code,
+      status: response.status,
+      retryAfter: retryAfter ? Number(retryAfter) : undefined,
+    })
+  }
+  throw new Error('Binance 时间同步重试失败')
+}
+
+export function resetBinanceNetworkState() {
+  networkRevision += 1
+  rateLimitStates.clear()
+  serverTimeStates.clear()
+}
+
+export function setBinanceRequestFetcherForTests(fetcher) {
+  if (process.env.ATLAS_QA_CHILD !== '1') throw new Error('Binance test transport is only available in the isolated QA process')
+  if (typeof fetcher !== 'function') throw new Error('Binance test transport must be a function')
+  binanceRequestFetcher = fetcher
+  resetBinanceNetworkState()
+  return () => {
+    binanceRequestFetcher = fetchWithProxy
+    resetBinanceNetworkState()
+  }
+}
+
+export async function requestBinanceForTests(options) {
+  if (process.env.ATLAS_QA_CHILD !== '1') throw new Error('Binance test request is only available in the isolated QA process')
+  return request(options)
 }
 
 function binancePositionKey(position) {
@@ -774,9 +942,12 @@ export async function getAccountSnapshot(options) {
       request({ environment, marketType, path: '/fapi/v3/account', signed: true }),
       getBinancePositionRisk(environment),
       getBinancePositionMode(environment),
-      request({ environment, marketType, path: '/fapi/v1/income', params: { incomeType: 'REALIZED_PNL', startTime: startOfDay.getTime(), limit: 1000 }, signed: true }).catch(() => []),
+      request({ environment, marketType, path: '/fapi/v1/income', params: { startTime: startOfDay.getTime(), limit: 1000 }, signed: true }).catch(() => []),
     ])
-    const realizedToday = Array.isArray(income) ? income.reduce((sum, item) => sum + Number(item.income || 0), 0) : 0
+    const incomeRows = Array.isArray(income) ? income : []
+    const realizedToday = incomeRows.filter((item) => item.incomeType === 'REALIZED_PNL').reduce((sum, item) => sum + finiteNumber(item.income), 0)
+    const commissionToday = incomeRows.filter((item) => item.incomeType === 'COMMISSION').reduce((sum, item) => sum + finiteNumber(item.income), 0)
+    const fundingPnlToday = incomeRows.filter((item) => item.incomeType === 'FUNDING_FEE').reduce((sum, item) => sum + finiteNumber(item.income), 0)
     const unrealizedPnl = Number(account.totalUnrealizedProfit)
     const riskByPosition = new Map(positionRisk.rows.map((position) => [binancePositionKey(position), position]))
     const positions = (account.positions || []).map((position) => {
@@ -840,7 +1011,9 @@ export async function getAccountSnapshot(options) {
       availableBalance: Number(account.availableBalance),
       unrealizedPnl,
       realizedPnl: realizedToday,
-      todayPnl: realizedToday + unrealizedPnl,
+      commissionToday,
+      fundingPnlToday,
+      todayPnl: realizedToday + commissionToday + fundingPnlToday + unrealizedPnl,
       balances: account.assets?.filter((asset) => Number(asset.walletBalance) !== 0) || [],
       positions: positions.filter((position) => Number(position.positionAmt) !== 0),
       portfolio,
@@ -990,7 +1163,7 @@ export async function setFuturesPositionMode(options) {
       signed: true,
     })
   } catch (error) {
-    if (!String(error?.message || '').toLowerCase().includes('no need to change position side')) throw error
+    if (Number(error?.code) !== -4059 && !String(error?.message || '').toLowerCase().includes('no need to change position side')) throw error
   }
   futuresPositionModeCaches[environment] = { expiresAt: Date.now() + 30_000, value: positionMode }
   return { positionMode, source: 'binance', environment }
@@ -1048,7 +1221,7 @@ export async function setFuturesMarginType(options) {
   try {
     await request({ environment, marketType: 'futures', path: '/fapi/v1/marginType', method: 'POST', params: { symbol, marginType }, signed: true })
   } catch (error) {
-    if (!String(error?.message || '').toLowerCase().includes('no need to change margin type')) throw error
+    if (Number(error?.code) !== -4046 && !String(error?.message || '').toLowerCase().includes('no need to change margin type')) throw error
   }
   return { ...(await getFuturesConfiguration(options)), marginType }
 }
@@ -1093,6 +1266,54 @@ export async function adjustFuturesPositionMargin(options) {
   return { ...configuration, amount, action, code: result.code, message: result.msg }
 }
 
+export function aggregateOrderTrades(trades) {
+  const aggregates = new Map()
+  for (const trade of Array.isArray(trades) ? trades : []) {
+    const orderId = String(trade.orderId ?? '')
+    if (!orderId) continue
+    const current = aggregates.get(orderId) || { executedQty: 0, quoteQty: 0, realizedPnl: 0, commissions: new Map(), trades: 0 }
+    const quantity = finiteNumber(trade.qty)
+    current.executedQty += quantity
+    current.quoteQty += finiteNumber(trade.quoteQty, finiteNumber(trade.price) * quantity)
+    current.realizedPnl += finiteNumber(trade.realizedPnl)
+    const commissionAsset = String(trade.commissionAsset || '').trim()
+    if (commissionAsset) current.commissions.set(commissionAsset, (current.commissions.get(commissionAsset) || 0) + finiteNumber(trade.commission))
+    current.trades += 1
+    aggregates.set(orderId, current)
+  }
+  return aggregates
+}
+
+function enrichBinanceOrder(order, aggregate, environment, marketType) {
+  const executedQty = finiteNumber(order.executedQty, aggregate?.executedQty)
+  const quoteQty = finiteNumber(order.cumQuote ?? order.cummulativeQuoteQty, aggregate?.quoteQty)
+  const commissionDetails = aggregate
+    ? [...aggregate.commissions.entries()].map(([asset, amount]) => ({ asset, amount: String(amount) }))
+    : []
+  const singleCommission = commissionDetails.length === 1 ? commissionDetails[0] : null
+  const exchangeAverage = finiteNumber(order.avgPrice)
+  const avgPrice = exchangeAverage > 0
+    ? String(exchangeAverage)
+    : executedQty > 0 && quoteQty > 0
+      ? String(quoteQty / executedQty)
+      : '0'
+  return {
+    ...order,
+    environment,
+    marketType,
+    quantity: order.origQty,
+    executedQty: String(order.executedQty ?? aggregate?.executedQty ?? '0'),
+    avgPrice,
+    transactTime: order.time || order.updateTime,
+    ...(aggregate ? {
+      commission: singleCommission?.amount,
+      commissionAsset: singleCommission?.asset,
+      commissionDetails,
+      ...(marketType === 'futures' ? { realizedPnl: String(aggregate.realizedPnl) } : {}),
+    } : {}),
+  }
+}
+
 export async function getOrders(options) {
   const environment = options.environment === 'live' ? 'live' : 'testnet'
   const marketType = options.marketType === 'futures' ? 'futures' : 'spot'
@@ -1100,15 +1321,77 @@ export async function getOrders(options) {
     await ensurePaperLoaded()
     return simulationOrders.filter((order) => order.marketType === marketType && (!options.symbol || order.symbol === options.symbol)).slice(0, 100)
   }
+  const symbol = normalizeFuturesSymbol(options.symbol || 'BTCUSDT')
   const path = marketType === 'futures' ? '/fapi/v1/allOrders' : '/api/v3/allOrders'
-  const rows = await request({ environment, marketType, path, params: { symbol: options.symbol || 'BTCUSDT', limit: 100 }, signed: true })
-  return rows.map((order) => ({
-    ...order,
-    environment,
-    marketType,
-    quantity: order.origQty,
-    transactTime: order.time || order.updateTime,
-  }))
+  const tradesPath = marketType === 'futures' ? '/fapi/v1/userTrades' : '/api/v3/myTrades'
+  const [rows, trades] = await Promise.all([
+    request({ environment, marketType, path, params: { symbol, limit: 100 }, signed: true }),
+    request({ environment, marketType, path: tradesPath, params: { symbol, limit: 1000 }, signed: true }).catch(() => null),
+  ])
+  const aggregates = aggregateOrderTrades(trades)
+  return rows.map((order) => enrichBinanceOrder(order, aggregates.get(String(order.orderId)), environment, marketType))
+}
+
+function orderIdentifierParams(options) {
+  const symbol = normalizeFuturesSymbol(options.symbol)
+  const orderId = String(options.orderId ?? '').trim()
+  const clientOrderId = String(options.clientOrderId || '').trim()
+  if (!orderId && !clientOrderId) throw new Error('查询订单必须提供 orderId 或 clientOrderId')
+  if (orderId && !/^\d+$/.test(orderId)) throw new Error('Invalid order id')
+  if (clientOrderId && !/^[A-Za-z0-9_-]{1,36}$/.test(clientOrderId)) throw new Error('Invalid client order id')
+  return { symbol, orderId: orderId || undefined, origClientOrderId: clientOrderId || undefined }
+}
+
+export async function getOpenOrders(options) {
+  const marketType = options.marketType === 'futures' ? 'futures' : 'spot'
+  if (options.environment === 'paper') {
+    await ensurePaperLoaded()
+    return simulationOrders.filter((order) => order.marketType === marketType && order.status === 'NEW' && (!options.symbol || order.symbol === options.symbol))
+  }
+  const environment = options.environment === 'live' ? 'live' : 'testnet'
+  const symbol = normalizeFuturesSymbol(options.symbol || 'BTCUSDT')
+  const path = marketType === 'futures' ? '/fapi/v1/openOrders' : '/api/v3/openOrders'
+  const rows = await request({ environment, marketType, path, params: { symbol }, signed: true })
+  return rows.map((order) => enrichBinanceOrder(order, null, environment, marketType))
+}
+
+export async function getOrder(options) {
+  const marketType = options.marketType === 'futures' ? 'futures' : 'spot'
+  const params = orderIdentifierParams(options)
+  if (options.environment === 'paper') {
+    await ensurePaperLoaded()
+    const order = simulationOrders.find((item) => item.marketType === marketType && item.symbol === params.symbol && (
+      (params.orderId && String(item.orderId) === params.orderId) || (params.origClientOrderId && item.clientOrderId === params.origClientOrderId)
+    ))
+    if (!order) throw new Error('未找到模拟订单')
+    return order
+  }
+  const environment = options.environment === 'live' ? 'live' : 'testnet'
+  const path = marketType === 'futures' ? '/fapi/v1/order' : '/api/v3/order'
+  const order = await request({ environment, marketType, path, params, signed: true })
+  return enrichBinanceOrder(order, null, environment, marketType)
+}
+
+export async function cancelOrder(options) {
+  const marketType = options.marketType === 'futures' ? 'futures' : 'spot'
+  const params = orderIdentifierParams(options)
+  if (options.environment === 'paper') {
+    await ensurePaperLoaded()
+    const order = simulationOrders.find((item) => item.marketType === marketType && item.symbol === params.symbol && (
+      (params.orderId && String(item.orderId) === params.orderId) || (params.origClientOrderId && item.clientOrderId === params.origClientOrderId)
+    ))
+    if (!order) throw new Error('未找到模拟订单')
+    if (order.status !== 'NEW') throw new Error('只有未成交挂单可以撤销')
+    order.status = 'CANCELED'
+    order.updateTime = Date.now()
+    await persistPaperAccounts()
+    return order
+  }
+  const environment = options.environment === 'live' ? 'live' : 'testnet'
+  if (environment === 'live' && options.confirmation !== 'LIVE_CANCEL_CONFIRMED') throw new Error('生产撤单缺少二次确认')
+  const path = marketType === 'futures' ? '/fapi/v1/order' : '/api/v3/order'
+  const order = await request({ environment, marketType, path, method: 'DELETE', params, signed: true })
+  return enrichBinanceOrder(order, null, environment, marketType)
 }
 
 export async function prepareBinanceOrder(order) {
@@ -1137,9 +1420,11 @@ export async function placeOrder(order) {
     if (order.marketType === 'futures') paperFuturesOrderContext(order)
     const fillPrice = await resolvePaperFillPrice(order)
     const marketable = isPaperOrderMarketable(order, fillPrice)
+    let execution = { realizedPnl: 0 }
     if (marketable) {
-      if (order.marketType === 'futures') fillPaperFuturesOrder(order, fillPrice)
-      else fillPaperSpotOrder(order, fillPrice)
+      execution = order.marketType === 'futures'
+        ? fillPaperFuturesOrder(order, fillPrice)
+        : fillPaperSpotOrder(order, fillPrice)
     } else {
       validatePendingPaperOrder(order)
     }
@@ -1151,6 +1436,9 @@ export async function placeOrder(order) {
       executedQty: marketable ? String(order.quantity) : '0',
       price: order.type === 'LIMIT' ? String(order.price) : String(fillPrice),
       avgPrice: marketable ? String(fillPrice) : '0',
+      realizedPnl: marketable ? String(execution.realizedPnl) : undefined,
+      commission: marketable ? '0' : undefined,
+      commissionAsset: marketable ? 'USDT' : undefined,
       transactTime: Date.now(),
     }
     simulationOrders.unshift(created)
@@ -1175,6 +1463,7 @@ export async function placeOrder(order) {
     if (positionMode === 'ONE_WAY' && positionSide !== 'BOTH') throw new Error('单向持仓模式只能使用 BOTH positionSide')
   }
   const path = marketType === 'futures' ? '/fapi/v1/order' : '/api/v3/order'
+  const clientOrderId = preparedOrder.clientOrderId || `atlas_${randomUUID().replaceAll('-', '').slice(0, 26)}`
   const params = {
     symbol: preparedOrder.symbol,
     side: preparedOrder.side,
@@ -1184,8 +1473,31 @@ export async function placeOrder(order) {
     timeInForce: preparedOrder.type === 'LIMIT' ? 'GTC' : undefined,
     positionSide: marketType === 'futures' && positionMode === 'HEDGE' ? positionSide : undefined,
     reduceOnly: marketType === 'futures' && preparedOrder.reduceOnly ? 'true' : undefined,
-    newClientOrderId: preparedOrder.clientOrderId,
+    newClientOrderId: clientOrderId,
     newOrderRespType: marketType === 'futures' ? 'RESULT' : 'FULL',
   }
-  return request({ environment, marketType, path, method: 'POST', params, signed: true })
+  const pendingKey = `${environment}:${marketType}:${clientOrderId}`
+  if (pendingLiveOrders.has(pendingKey)) return pendingLiveOrders.get(pendingKey)
+  const submission = request({ environment, marketType, path, method: 'POST', params, signed: true })
+    .catch(async (error) => {
+      const ambiguous = !(error instanceof BinanceApiError)
+        || Number(error.status) >= 500
+        || Number(error.code) === -1007
+        || (Number(error.code) === -2010 && /duplicate/i.test(String(error.message)))
+      if (!ambiguous) throw error
+      try {
+        return await request({
+          environment,
+          marketType,
+          path,
+          params: { symbol: preparedOrder.symbol, origClientOrderId: clientOrderId },
+          signed: true,
+        })
+      } catch {
+        throw error
+      }
+    })
+    .finally(() => pendingLiveOrders.delete(pendingKey))
+  pendingLiveOrders.set(pendingKey, submission)
+  return submission
 }

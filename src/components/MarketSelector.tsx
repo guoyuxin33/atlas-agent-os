@@ -1,16 +1,20 @@
 import { Check, ChevronDown, RefreshCw, Search, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMarketCatalog } from '../hooks/useMarketCatalog'
-import type { MarketType } from '../types'
+import { useMarketEnvironment } from '../contexts/MarketEnvironmentContext'
+import type { Environment, MarketType } from '../types'
 
 interface MarketSelectorProps {
   marketType: MarketType
+  environment?: Environment
   value: string
   onChange: (symbol: string) => void
 }
 
-export function MarketSelector({ marketType, value, onChange }: MarketSelectorProps) {
-  const { markets, loading, error, refresh } = useMarketCatalog(marketType)
+export function MarketSelector({ marketType, environment: environmentOverride, value, onChange }: MarketSelectorProps) {
+  const inheritedEnvironment = useMarketEnvironment()
+  const environment = environmentOverride || inheritedEnvironment
+  const { markets, loading, error, refresh } = useMarketCatalog(environment, marketType)
   const [openFor, setOpenFor] = useState<MarketType | null>(null)
   const [query, setQuery] = useState('')
   const [activeIndex, setActiveIndex] = useState(0)

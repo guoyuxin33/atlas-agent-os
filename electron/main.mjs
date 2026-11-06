@@ -2,8 +2,8 @@ import { app, BrowserWindow, ipcMain, Menu, shell } from 'electron'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AgentRuntime } from './services/agent-runtime.mjs'
-import { chatWithModel } from './services/ai.mjs'
-import { adjustFuturesPositionMargin, getAccountSnapshot, getFuturesConfiguration, getFuturesPositionMode, getOrders, placeOrder, prepareBinanceOrder, setFuturesLeverage, setFuturesMarginType, setFuturesPositionMode, testBinanceConnection } from './services/binance.mjs'
+import { chatWithModel, superviseAgentCandidate } from './services/ai.mjs'
+import { adjustFuturesPositionMargin, cancelOrder, getAccountSnapshot, getFuturesConfiguration, getFuturesPositionMode, getOpenOrders, getOrder, getOrders, placeOrder, prepareBinanceOrder, resetBinanceNetworkState, setFuturesLeverage, setFuturesMarginType, setFuturesPositionMode, testBinanceConnection } from './services/binance.mjs'
 import { ChatSessionStore } from './services/chat-sessions.mjs'
 import { MarketDataHub } from './services/market-data.mjs'
 import { callMcpTool, connectMcp } from './services/mcp.mjs'
@@ -17,6 +17,7 @@ const isDevelopment = Boolean(process.env.VITE_DEV_SERVER_URL)
 let executionHalted = false
 
 app.setName('Atlas Agent OS')
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
 const marketHub = new MarketDataHub()
 const userDataHub = new UserDataHub()
 let agentRuntime = null
@@ -30,6 +31,7 @@ async function getAgentRuntime() {
       placeOrder,
       getAccountSnapshot,
       isExecutionHalted: () => executionHalted,
+      superviseCandidate: superviseAgentCandidate,
     })
   }
   await agentRuntime.initialize()
@@ -158,6 +160,7 @@ ipcMain.handle('vault:save', async (_event, namespace, values) => {
   }
   const result = await saveVault(namespace, nextValues)
   if (namespace === 'network') {
+    resetBinanceNetworkState()
     marketHub.reconnectAll()
     userDataHub.reconnectAll()
   }
@@ -179,6 +182,9 @@ ipcMain.handle('market:unsubscribe', (event, options) => marketHub.unsubscribe(e
 ipcMain.handle('binance:test', (_event, options) => testBinanceConnection(options))
 ipcMain.handle('binance:account', (_event, options) => getAccountSnapshot(options))
 ipcMain.handle('binance:orders', (_event, options) => getOrders(options))
+ipcMain.handle('binance:openOrders', (_event, options) => getOpenOrders(options))
+ipcMain.handle('binance:order', (_event, options) => getOrder(options))
+ipcMain.handle('binance:cancelOrder', (_event, options) => cancelOrder(options))
 ipcMain.handle('binance:futuresConfig', (_event, options) => getFuturesConfiguration(options))
 ipcMain.handle('binance:futuresPositionMode', (_event, options) => getFuturesPositionMode(options))
 ipcMain.handle('binance:setFuturesLeverage', (_event, options) => setFuturesLeverage(options))
@@ -199,6 +205,7 @@ ipcMain.handle('risk:setHalted', (_event, halted) => {
 ipcMain.handle('risk:status', () => ({ halted: executionHalted }))
 
 ipcMain.handle('agents:create', async (_event, definition) => (await getAgentRuntime()).create(definition))
+ipcMain.handle('agents:update', async (_event, agentId, definition, expectedRevision) => (await getAgentRuntime()).update(agentId, definition, expectedRevision))
 ipcMain.handle('agents:start', async (_event, agentId) => (await getAgentRuntime()).start(agentId))
 ipcMain.handle('agents:pause', async (_event, agentId) => (await getAgentRuntime()).pause(agentId))
 ipcMain.handle('agents:evaluate-now', async (_event, agentId) => (await getAgentRuntime()).evaluateNow(agentId))
@@ -222,14 +229,26 @@ ipcMain.handle('mcp:connect', (_event, options) => connectMcp(options))
 ipcMain.handle('mcp:call', (_event, options) => callMcpTool(options))
 ipcMain.handle('network:test', (_event, options) => testNetwork(options))
 
-app.whenReady().then(async () => {
-  createMenu()
-  await getAgentRuntime()
-  createWindow()
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+if (!hasSingleInstanceLock) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    const window = BrowserWindow.getAllWindows()[0]
+    if (!window) return
+    if (window.isMinimized()) window.restore()
+    window.show()
+    window.focus()
   })
-})
+
+  app.whenReady().then(async () => {
+    createMenu()
+    await getAgentRuntime()
+    createWindow()
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    })
+  })
+}
 
 app.on('before-quit', () => {
   void agentRuntime?.close()

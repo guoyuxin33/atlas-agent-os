@@ -6,10 +6,14 @@ import { ATR, BollingerBands, EMA, RSI, SMA } from 'technicalindicators'
 const STRATEGIES = new Set(['ma-crossover', 'donchian', 'rsi', 'bollinger', 'atr-breakout'])
 const ENVIRONMENTS = new Set(['paper', 'testnet', 'live'])
 const INTERVALS = new Set(['1m', '5m', '15m', '1h', '4h', '1d'])
+const POSITION_MODES = new Set(['long-only', 'short-only', 'auto'])
 const MAX_LOGS_IN_MEMORY = 10_000
 const LIVE_INTENT_TTL = 30_000
 const MAX_CONFIRMATION_PRICE_DEVIATION = 0.005
 const WATCHDOG_INTERVAL = 30_000
+const WATCHDOG_RETRY_INTERVAL = 60_000
+const WATCHDOG_STALE_HEARTBEAT = 90_000
+const DEFAULT_AI_TIMEOUT = 15_000
 
 const INTERVAL_MS = {
   '1m': 60_000,
@@ -52,10 +56,72 @@ function cleanParams(value) {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => ['string', 'number', 'boolean'].includes(typeof item)))
 }
 
+function normalizeIntelligence(value = {}) {
+  const mode = value?.mode === 'ai-supervised' ? 'ai-supervised' : 'strategy'
+  const model = String(value?.model || '').trim().slice(0, 160)
+  const skills = [...new Set((Array.isArray(value?.skills) ? value.skills : [])
+    .map((item) => String(item || '').trim())
+    .filter((item) => /^[A-Za-z0-9_.-]{1,80}$/.test(item)))]
+    .slice(0, 32)
+  const mcpServers = [...new Set((Array.isArray(value?.mcpServers) ? value.mcpServers : [])
+    .map((item) => String(item || '').trim())
+    .filter((item) => {
+      try {
+        const url = new URL(item)
+        return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password
+      } catch {
+        return false
+      }
+    }))]
+    .slice(0, 8)
+  const mcpTools = [...new Set((Array.isArray(value?.mcpTools) ? value.mcpTools : [])
+    .map((item) => String(item || '').trim())
+    .filter((item) => item.length > 0 && item.length <= 128 && !/[\u0000-\u001f\u007f]/.test(item)))]
+    .slice(0, 64)
+  return {
+    mode,
+    ...(model ? { model } : {}),
+    skills,
+    mcpServers,
+    mcpTools,
+    confidenceThreshold: clamp(finiteNumber(value?.confidenceThreshold, 0.7), 0, 1),
+    // Supervised execution is always fail-closed. The field is persisted so the policy is explicit to clients.
+    failClosed: mode === 'ai-supervised' ? true : value?.failClosed !== false,
+  }
+}
+
+function normalizeAiDecision(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('AI 监督结果不是结构化对象')
+  const decision = String(value.decision || '').trim().toUpperCase()
+  if (!['APPROVE', 'REJECT'].includes(decision)) throw new Error('AI 监督结果 decision 必须是 APPROVE 或 REJECT')
+  const confidence = Number(value.confidence)
+  if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) throw new Error('AI 监督结果 confidence 必须在 0 到 1 之间')
+  const reason = String(value.reason || '').trim().slice(0, 1000)
+  if (!reason) throw new Error('AI 监督结果缺少理由')
+  return {
+    decision,
+    confidence,
+    reason,
+    model: String(value.model || '').trim().slice(0, 160) || undefined,
+    usage: value.usage && typeof value.usage === 'object' ? value.usage : undefined,
+  }
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  let timer
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs) }),
+  ]).finally(() => clearTimeout(timer))
+}
+
 function normalizeAgent(input = {}) {
   const strategy = STRATEGIES.has(input.strategy) ? input.strategy : 'ma-crossover'
   const environment = ENVIRONMENTS.has(input.environment) ? input.environment : 'paper'
   const marketType = input.marketType === 'futures' ? 'futures' : 'spot'
+  const positionMode = marketType === 'spot'
+    ? 'long-only'
+    : POSITION_MODES.has(input.positionMode) ? input.positionMode : 'auto'
   const interval = INTERVALS.has(input.interval) ? input.interval : '15m'
   const name = String(input.name || `${normalizeSymbol(input.symbol)} ${strategy}`).trim().slice(0, 80)
   const maxNotional = clamp(finiteNumber(input.risk?.maxNotional, 100), 1, 10_000_000)
@@ -63,13 +129,16 @@ function normalizeAgent(input = {}) {
   const now = Date.now()
   return {
     id: randomUUID(),
+    revision: 1,
     name: name || `Agent ${strategy}`,
     strategy,
     environment,
     marketType,
+    positionMode,
     symbol: normalizeSymbol(input.symbol),
     interval,
     status: 'paused',
+    intelligence: normalizeIntelligence(input.intelligence),
     params: { ...STRATEGY_DEFAULTS[strategy], ...cleanParams(input.params) },
     risk: {
       riskFraction: clamp(finiteNumber(input.risk?.riskFraction, 0.005), 0.0001, 0.01),
@@ -91,6 +160,7 @@ function safeAgent(saved) {
     return {
       ...normalized,
       id: String(saved.id),
+      revision: Math.max(1, Math.floor(finiteNumber(saved.revision, 1))),
       name: String(saved.name || normalized.name).slice(0, 80),
       status: saved.status === 'running' ? 'running' : 'paused',
       runtime: saved.runtime && typeof saved.runtime === 'object' ? { ...saved.runtime } : { position: 'flat' },
@@ -129,6 +199,8 @@ function evaluateStrategy(agent, candles) {
     if ([previousFast, currentFast, previousSlow, currentSlow].some((value) => !Number.isFinite(value))) return null
     if (previousFast <= previousSlow && currentFast > currentSlow) return { direction: 'long', reason: `${type} ${fastPeriod}/${slowPeriod} 金叉` }
     if (previousFast >= previousSlow && currentFast < currentSlow) return { direction: 'short', reason: `${type} ${fastPeriod}/${slowPeriod} 死叉` }
+    if (agent.runtime?.position === 'flat' && currentFast > currentSlow) return { direction: 'long', reason: `${type} ${fastPeriod}/${slowPeriod} 多头排列，空仓进入趋势` }
+    if (agent.runtime?.position === 'flat' && currentFast < currentSlow) return { direction: 'short', reason: `${type} ${fastPeriod}/${slowPeriod} 空头排列，空仓进入趋势` }
     return null
   }
 
@@ -214,13 +286,15 @@ function isClosingOrder(order) {
 }
 
 export class AgentRuntime {
-  constructor({ dataDirectory, marketHub, placeOrder, getAccountSnapshot, isExecutionHalted }) {
+  constructor({ dataDirectory, marketHub, placeOrder, getAccountSnapshot, isExecutionHalted, superviseCandidate, aiTimeoutMs = DEFAULT_AI_TIMEOUT }) {
     if (!dataDirectory) throw new Error('Agent runtime data directory is required')
     this.dataDirectory = dataDirectory
     this.marketHub = marketHub
     this.placeOrder = placeOrder
     this.getAccountSnapshot = getAccountSnapshot
     this.isExecutionHalted = isExecutionHalted || (() => false)
+    this.superviseCandidate = superviseCandidate
+    this.aiTimeoutMs = clamp(finiteNumber(aiTimeoutMs, DEFAULT_AI_TIMEOUT), 100, 60_000)
     this.definitionsPath = join(dataDirectory, 'definitions.json')
     this.eventsPath = join(dataDirectory, 'events.ndjson')
     this.agents = new Map()
@@ -283,8 +357,70 @@ export class AgentRuntime {
     const agent = normalizeAgent(input)
     this.agents.set(agent.id, agent)
     await this.#persistDefinitions()
-    await this.#log(agent.id, 'agent.created', 'info', 'Agent 已创建，默认保持暂停', { strategy: agent.strategy })
+    await this.#log(agent.id, 'agent.created', 'info', 'Agent 已创建，默认保持暂停', { strategy: agent.strategy, positionMode: agent.positionMode })
     return structuredClone(agent)
+  }
+
+  async update(agentId, input, expectedRevision) {
+    await this.initialize()
+    const previous = this.#requireAgent(agentId)
+    const requiredRevision = Number(expectedRevision)
+    if (Number.isFinite(requiredRevision) && requiredRevision !== previous.revision) {
+      throw new Error('Agent 配置已被其他操作更新，请刷新后重试')
+    }
+
+    const normalized = normalizeAgent(input)
+    const wasRunning = previous.status === 'running'
+    if (wasRunning) {
+      this.subscriptions.get(previous.id)?.()
+      this.subscriptions.delete(previous.id)
+      previous.status = 'paused'
+      previous.runtime = { ...previous.runtime, marketConnected: false, nextEvaluationAt: undefined }
+      previous.updatedAt = Date.now()
+      await this.#persistDefinitions()
+      await this.#log(previous.id, 'agent.paused', 'warning', '编辑配置前已安全暂停 Agent')
+    }
+
+    await Promise.allSettled([
+      this.evaluationQueues.get(previous.id),
+      this.latestChecks.get(previous.id),
+      ...[...this.intents.values()]
+        .filter((intent) => intent.agentId === previous.id)
+        .map((intent) => this.intentConfirmations.get(intent.id)),
+    ].filter(Boolean))
+
+    for (const intent of this.intents.values()) {
+      if (intent.agentId !== previous.id || intent.status !== 'pending') continue
+      await this.#updateIntent(intent, 'rejected', { error: 'Agent 配置已更新，旧交易意图失效' })
+      await this.#log(previous.id, 'INTENT_INVALIDATED', 'warning', 'Agent 配置已更新，旧生产交易意图已失效', { intentId: intent.id })
+    }
+
+    const updated = {
+      ...normalized,
+      id: previous.id,
+      revision: previous.revision + 1,
+      status: 'paused',
+      runtime: { position: 'flat' },
+      createdAt: previous.createdAt,
+      updatedAt: Date.now(),
+    }
+    this.agents.set(updated.id, updated)
+    await this.#persistDefinitions()
+    await this.#log(updated.id, 'agent.updated', 'info', 'Agent 配置已保存，保持暂停以便重新确认后启动', {
+      revision: updated.revision,
+      wasRunning,
+      configuration: {
+        name: updated.name,
+        strategy: updated.strategy,
+        environment: updated.environment,
+        marketType: updated.marketType,
+        positionMode: updated.positionMode,
+        symbol: updated.symbol,
+        interval: updated.interval,
+      },
+    })
+    this.#syncWatchdog()
+    return structuredClone(updated)
   }
 
   async start(agentId) {
@@ -302,7 +438,7 @@ export class AgentRuntime {
     agent.updatedAt = Date.now()
     this.#subscribe(agent)
     await this.#persistDefinitions()
-    await this.#log(agent.id, 'agent.started', 'info', `Agent 已订阅 ${agent.symbol} ${agent.interval}`)
+    await this.#log(agent.id, 'agent.started', 'info', `Agent 已订阅 ${agent.symbol} ${agent.interval}`, { positionMode: agent.positionMode })
     this.#syncWatchdog()
     this.#scheduleLatestCheck(agent.id, 'start')
     return structuredClone(agent)
@@ -371,6 +507,10 @@ export class AgentRuntime {
     if (intent.status !== 'pending') throw new Error('该交易意图已处理')
     if (intent.environment !== 'live') throw new Error('只有生产订单需要逐单确认')
     const agent = this.#requireAgent(intent.agentId)
+    if (!Number.isInteger(intent.agentRevision) || intent.agentRevision !== agent.revision) {
+      await this.#updateIntent(intent, 'rejected', { error: 'Agent 配置版本已变化，旧交易意图不能确认' })
+      throw new Error('Agent 配置已更新，请等待新策略信号')
+    }
     if (Date.now() > intent.expiresAt) {
       await this.#updateIntent(intent, 'expired', { error: '交易意图已过期' })
       await this.#log(agent.id, 'REJECTED', 'warning', '生产交易确认已过期', { intentId: intent.id })
@@ -383,7 +523,7 @@ export class AgentRuntime {
     let submitting = false
     try {
       if (this.isExecutionHalted()) throw new Error('风控总闸已关闭，交易意图不能执行')
-      const history = await this.marketHub.history({ marketType: agent.marketType, symbol: agent.symbol, interval: agent.interval, limit: 100 })
+      const history = await this.marketHub.history({ environment: agent.environment, marketType: agent.marketType, symbol: agent.symbol, interval: agent.interval, limit: 100 })
       const latestPrice = finiteNumber(history.at(-1)?.close)
       const intendedPrice = finiteNumber(intent.order.marketPrice)
       if (!(latestPrice > 0) || !(intendedPrice > 0)) throw new Error('确认前无法获得有效的最新价格')
@@ -475,8 +615,20 @@ export class AgentRuntime {
     }
     if (hasRunningAgents && !this.watchdogTimer) {
       this.watchdogTimer = setInterval(() => {
+        const now = Date.now()
         for (const agent of this.agents.values()) {
-          if (agent.status === 'running') this.#scheduleLatestCheck(agent.id, 'watchdog')
+          if (agent.status !== 'running') continue
+          const runtime = agent.runtime || {}
+          const lastCheckAt = finiteNumber(runtime.lastCheckAt)
+          const lastHeartbeatAt = finiteNumber(runtime.lastHeartbeatAt)
+          const nextEvaluationAt = finiteNumber(runtime.nextEvaluationAt)
+          const retryDue = Boolean(runtime.lastError) && now - lastCheckAt >= WATCHDOG_RETRY_INTERVAL
+          const candleDue = !nextEvaluationAt || nextEvaluationAt <= now + 2_000
+          const streamStale = runtime.marketConnected === false
+            || !lastHeartbeatAt
+            || now - lastHeartbeatAt >= WATCHDOG_STALE_HEARTBEAT
+          const disconnectedProbeDue = streamStale && now - lastCheckAt >= WATCHDOG_RETRY_INTERVAL
+          if (candleDue || retryDue || disconnectedProbeDue) this.#scheduleLatestCheck(agent.id, 'watchdog')
         }
       }, WATCHDOG_INTERVAL)
       this.watchdogTimer.unref?.()
@@ -507,11 +659,15 @@ export class AgentRuntime {
         nextEvaluationAt: this.#nextEvaluationAt(agent.interval),
       }
       try {
-        const history = await this.marketHub.history({ marketType: agent.marketType, symbol: agent.symbol, interval: agent.interval, limit: 100 })
+        const history = await this.marketHub.history({ environment: agent.environment, marketType: agent.marketType, symbol: agent.symbol, interval: agent.interval, limit: 500 })
         const candle = this.#latestClosedCandle(history, agent.interval)
         if (!candle) throw new Error('最近历史数据中没有已闭合 K 线')
         agent.runtime = { ...agent.runtime, marketConnected: true, lastHeartbeatAt: Date.now(), lastError: undefined }
         if (agent.runtime.lastEvaluatedCandle === finiteNumber(candle.time)) {
+          await this.#reconcilePosition(agent, finiteNumber(candle.close), undefined, {
+            alwaysLog: reason !== 'watchdog',
+            messagePrefix: '检查后持仓',
+          })
           if (reason !== 'watchdog') {
             await this.#log(agent.id, 'agent.checked', 'info', `最近闭合 K 线已评估，继续等待 ${agent.interval} 新 K 线`, { reason, candleTime: candle.time })
           }
@@ -555,7 +711,7 @@ export class AgentRuntime {
     agent.updatedAt = Date.now()
 
     try {
-      const history = await this.marketHub.history({ marketType: agent.marketType, symbol: agent.symbol, interval: agent.interval, limit: 500 })
+      const history = await this.marketHub.history({ environment: agent.environment, marketType: agent.marketType, symbol: agent.symbol, interval: agent.interval, limit: 500 })
       if (agent.status !== 'running') return { evaluated: false, reason: 'paused', candleTime }
       const byTime = new Map(history.filter((candle) => candle.time <= candleTime).map((candle) => [candle.time, candle]))
       byTime.set(candleTime, update.candle)
@@ -583,6 +739,18 @@ export class AgentRuntime {
         return { evaluated: true, candleTime }
       }
       await this.#log(agent.id, 'SIGNAL_EVALUATED', 'info', signal.reason, { candleTime, decision: signal.direction.toUpperCase(), signal })
+      const directionRejection = this.#directionRejection(agent, signal, agent.runtime.position)
+      if (directionRejection) {
+        await this.#log(agent.id, 'DIRECTION_FILTERED', 'info', directionRejection, {
+          candleTime,
+          direction: signal.direction,
+          positionMode: agent.positionMode,
+          currentPosition: agent.runtime.position,
+        })
+        await this.#markEvaluationCompleted(agent, candleTime)
+        await this.#log(agent.id, 'COMPLETED', 'info', '闭合 K 线评估结束：DIRECTION_FILTERED', { candleTime })
+        return { evaluated: true, candleTime, reason: 'direction-filtered' }
+      }
       await this.#log(agent.id, 'RISK_CHECKING', 'info', '正在计算仓位并执行主进程风控', { candleTime })
       let prepared
       try {
@@ -598,6 +766,21 @@ export class AgentRuntime {
         await this.#markEvaluationCompleted(agent, candleTime)
         await this.#log(agent.id, 'COMPLETED', 'info', '闭合 K 线评估结束：NO_ACTION', { candleTime })
         return { evaluated: true, candleTime }
+      }
+      if (agent.intelligence?.mode === 'ai-supervised') {
+        const approved = await this.#supervisePreparedOrder(agent, {
+          order: prepared,
+          signal,
+          candles,
+          snapshot,
+          candleTime,
+          position: position || null,
+        })
+        if (!approved) {
+          await this.#markEvaluationCompleted(agent, candleTime)
+          await this.#log(agent.id, 'COMPLETED', 'info', '闭合 K 线评估结束：AI_REJECTED', { candleTime })
+          return { evaluated: true, candleTime, reason: 'ai-rejected' }
+        }
       }
       await this.#dispatch(agent, prepared, signal.reason, candleTime)
       await this.#markEvaluationCompleted(agent, candleTime)
@@ -623,6 +806,108 @@ export class AgentRuntime {
     await this.#persistDefinitions()
   }
 
+  async #supervisePreparedOrder(agent, context) {
+    const intelligence = normalizeIntelligence(agent.intelligence)
+    const candidateOrder = structuredClone(context.order)
+    const request = {
+      agent: {
+        id: agent.id,
+        name: agent.name,
+        strategy: agent.strategy,
+        environment: agent.environment,
+        marketType: agent.marketType,
+        positionMode: agent.positionMode,
+        symbol: agent.symbol,
+        interval: agent.interval,
+        params: structuredClone(agent.params),
+        risk: structuredClone(agent.risk),
+      },
+      intelligence: structuredClone(intelligence),
+      candidateOrder,
+      signal: structuredClone(context.signal),
+      candleTime: context.candleTime,
+      candles: context.candles.slice(-100).map((candle) => ({
+        time: candle.time,
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close,
+        volume: candle.volume,
+      })),
+      account: {
+        totalWalletBalance: context.snapshot.totalWalletBalance,
+        availableBalance: context.snapshot.availableBalance,
+        unrealizedPnl: context.snapshot.unrealizedPnl,
+        todayPnl: context.snapshot.todayPnl,
+        position: context.position,
+      },
+    }
+    await this.#log(agent.id, 'AI_CONTEXT_READY', 'info', 'AI 监督上下文已冻结，候选订单不可由模型修改', {
+      candleTime: context.candleTime,
+      model: intelligence.model || null,
+      skills: intelligence.skills,
+      mcpServers: intelligence.mcpServers,
+      mcpTools: intelligence.mcpTools,
+      confidenceThreshold: intelligence.confidenceThreshold,
+      candidateOrder,
+    })
+    await this.#log(agent.id, 'AI_REASONING', 'info', '正在请求 AI 对确定性候选做批准或否决', {
+      candleTime: context.candleTime,
+      model: intelligence.model || null,
+    })
+
+    try {
+      if (typeof this.superviseCandidate !== 'function') throw new Error('AI 监督器未配置')
+      const rawDecision = await withTimeout(
+        Promise.resolve().then(() => this.superviseCandidate(request)),
+        this.aiTimeoutMs,
+        `AI 监督超时 (${this.aiTimeoutMs} ms)`,
+      )
+      if (agent.status !== 'running') {
+        await this.#log(agent.id, 'AI_REJECTED', 'warning', 'Agent 已暂停，丢弃 AI 监督结果', { candleTime: context.candleTime })
+        return false
+      }
+      const result = normalizeAiDecision(rawDecision)
+      const metadata = {
+        candleTime: context.candleTime,
+        decision: result.decision,
+        confidence: result.confidence,
+        confidenceThreshold: intelligence.confidenceThreshold,
+        reason: result.reason,
+        model: result.model || intelligence.model || null,
+        usage: result.usage || null,
+        candidateOrder,
+      }
+      if (result.decision !== 'APPROVE') {
+        await this.#log(agent.id, 'AI_REJECTED', 'warning', result.reason, metadata)
+        return false
+      }
+      if (result.confidence < intelligence.confidenceThreshold) {
+        await this.#log(agent.id, 'AI_REJECTED', 'warning', `AI 置信度 ${result.confidence.toFixed(2)} 低于阈值 ${intelligence.confidenceThreshold.toFixed(2)}`, {
+          ...metadata,
+          rejectionReason: 'LOW_CONFIDENCE',
+        })
+        return false
+      }
+      await this.#log(agent.id, 'AI_APPROVED', 'info', result.reason, metadata)
+      return true
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'AI 监督失败'
+      await this.#log(agent.id, 'AI_FAILED', 'error', message, {
+        candleTime: context.candleTime,
+        model: intelligence.model || null,
+        failClosed: true,
+        candidateOrder,
+      })
+      await this.#log(agent.id, 'AI_REJECTED', 'warning', 'AI 监督不可用，按 fail-closed 拒绝候选订单', {
+        candleTime: context.candleTime,
+        reason: message,
+        failClosed: true,
+      })
+      return false
+    }
+  }
+
   #prepareOrder(agent, snapshot, signal, marketPrice, candleTime, position) {
     if (this.isExecutionHalted()) throw new Error('风控总闸已关闭，Agent 拒绝生成订单')
     if (!(marketPrice > 0)) throw new Error('实时市场价格无效')
@@ -631,6 +916,8 @@ export class AgentRuntime {
     let reduceOnly = false
     let quantity
     const hedgeMode = agent.marketType === 'futures' && snapshot.futuresConfig?.positionMode === 'HEDGE'
+
+    if (currentPosition === 'flat' && this.#directionRejection(agent, signal, currentPosition)) return null
 
     if (signal.direction === 'long') {
       if (currentPosition === 'long') return null
@@ -682,8 +969,17 @@ export class AgentRuntime {
     }
   }
 
+  #directionRejection(agent, signal, currentPosition) {
+    if (currentPosition !== 'flat' || signal.exitOnly) return null
+    if (signal.direction === 'short' && agent.marketType === 'spot') return '现货 Agent 强制仅做多，空头开仓信号已过滤'
+    if (signal.direction === 'short' && agent.positionMode === 'long-only') return '仅做多模式已过滤空头开仓信号'
+    if (signal.direction === 'long' && agent.positionMode === 'short-only') return '仅做空模式已过滤多头开仓信号'
+    return null
+  }
+
   async #dispatch(agent, order, reason, candleTime) {
     try {
+      if (agent.status !== 'running' || this.agents.get(agent.id) !== agent) throw new Error('Agent 配置已变化，本次旧策略结果已丢弃')
       if (this.isExecutionHalted()) throw new Error('风控总闸已关闭，Agent 拒绝执行订单')
       await this.#validatePreparedOrder(agent, order)
     } catch (error) {
@@ -702,6 +998,7 @@ export class AgentRuntime {
       const intent = {
         id: randomUUID(),
         agentId: agent.id,
+        agentRevision: agent.revision,
         environment: 'live',
         status: 'pending',
         order,
@@ -745,17 +1042,20 @@ export class AgentRuntime {
     await this.#log(agent.id, 'UNKNOWN', 'warning', status ? `订单尚未终态：${status}` : '交易所响应中没有明确订单状态', { ...(intentId ? { intentId } : {}), result })
   }
 
-  async #reconcilePosition(agent, markPrice, intentId) {
+  async #reconcilePosition(agent, markPrice, intentId, { alwaysLog = true, messagePrefix = '订单后持仓' } = {}) {
     try {
       const snapshot = await this.getAccountSnapshot({ environment: agent.environment, marketType: agent.marketType, symbol: agent.symbol, markPrice })
       const matchingPositions = snapshot.portfolio?.filter((item) => item.symbol === agent.symbol) || []
       const position = (agent.runtime?.position === 'short' ? matchingPositions.find((item) => item.side === 'SHORT') : null)
         || (agent.runtime?.position === 'long' ? matchingPositions.find((item) => item.side === 'LONG') : null)
         || matchingPositions[0]
+      const previousPosition = agent.runtime.position
       agent.runtime.position = position?.side === 'SHORT' ? 'short' : position ? 'long' : 'flat'
       agent.updatedAt = Date.now()
       await this.#persistDefinitions()
-      await this.#log(agent.id, 'POSITION_RECONCILED', 'info', `订单后持仓：${agent.runtime.position}`, { ...(intentId ? { intentId } : {}), position: position || null })
+      if (alwaysLog || previousPosition !== agent.runtime.position) {
+        await this.#log(agent.id, 'POSITION_RECONCILED', 'info', `${messagePrefix}：${agent.runtime.position}`, { ...(intentId ? { intentId } : {}), position: position || null })
+      }
     } catch (error) {
       await this.#log(agent.id, 'POSITION_RECONCILED', 'warning', error instanceof Error ? error.message : '订单后持仓同步失败', { ...(intentId ? { intentId } : {}) })
     }
@@ -766,6 +1066,8 @@ export class AgentRuntime {
     const price = finiteNumber(order.marketPrice || order.price)
     const quantity = finiteNumber(order.quantity)
     const closing = isClosingOrder(order)
+    if (!closing && agent.positionMode === 'long-only' && order.side === 'SELL') throw new Error('仅做多模式禁止空头开仓')
+    if (!closing && agent.positionMode === 'short-only' && order.side === 'BUY') throw new Error('仅做空模式禁止多头开仓')
     if (!(price > 0) || !(quantity > 0)) throw new Error('订单价格或数量无效')
     if (quantity * price > finiteNumber(agent.risk.maxNotional, 100) + 1e-8 && !closing) throw new Error('订单名义价值超过 Agent 上限')
     const snapshot = await this.getAccountSnapshot({ environment: agent.environment, marketType: agent.marketType, symbol: agent.symbol, markPrice: price })

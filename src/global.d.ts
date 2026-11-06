@@ -10,16 +10,19 @@ interface Window {
     saveSecrets: (namespace: string, values: Record<string, string>) => Promise<{ ok: boolean }>
     vaultStatus: (namespace: string) => Promise<{ configured: boolean; config?: Record<string, string> }>
     market: {
-      history: (options: { marketType: 'spot' | 'futures'; symbol: string; interval: string; limit?: number }) => Promise<import('./types').Candle[]>
-      markets: (options: { marketType: 'spot' | 'futures' }) => Promise<Array<{ symbol: string; baseAsset: string; quoteAsset: string; status: string }>>
-      subscribe: (options: { marketType: 'spot' | 'futures'; symbol: string; interval: string }) => Promise<{ ok: boolean; topic: string }>
-      unsubscribe: (options: { marketType: 'spot' | 'futures'; symbol: string; interval: string }) => Promise<{ ok: boolean }>
+      history: (options: { environment: import('./types').Environment; marketType: 'spot' | 'futures'; symbol: string; interval: string; limit?: number }) => Promise<import('./types').Candle[]>
+      markets: (options: { environment: import('./types').Environment; marketType: 'spot' | 'futures' }) => Promise<Array<{ symbol: string; baseAsset: string; quoteAsset: string; status: string }>>
+      subscribe: (options: { environment: import('./types').Environment; marketType: 'spot' | 'futures'; symbol: string; interval: string }) => Promise<{ ok: boolean; topic: string }>
+      unsubscribe: (options: { environment: import('./types').Environment; marketType: 'spot' | 'futures'; symbol: string; interval: string }) => Promise<{ ok: boolean }>
       onUpdate: (callback: (update: import('./types').MarketUpdate) => void) => () => void
     }
     binance: {
       test: (options: { environment: string; marketTypes: string[]; apiKey?: string; apiSecret?: string }) => Promise<{ ok: boolean; latency: number }>
       account: (options: { environment: string; marketType: string; symbol?: string; positionSide?: 'LONG' | 'SHORT' | 'BOTH'; markPrice?: number }) => Promise<import('./types').AccountSnapshot>
       orders: (options: { environment: string; marketType: string; symbol?: string }) => Promise<import('./types').TradingOrder[]>
+      openOrders: (options: { environment: string; marketType: string; symbol?: string }) => Promise<import('./types').TradingOrder[]>
+      order: (options: { environment: string; marketType: string; symbol: string; orderId?: string | number; clientOrderId?: string }) => Promise<import('./types').TradingOrder>
+      cancelOrder: (options: { environment: string; marketType: string; symbol: string; orderId?: string | number; clientOrderId?: string; confirmation?: 'LIVE_CANCEL_CONFIRMED' }) => Promise<import('./types').TradingOrder>
       futuresConfig: (options: import('./types').FuturesAccountMutation) => Promise<import('./types').FuturesConfiguration>
       futuresPositionMode: (options: import('./types').FuturesAccountMutation) => Promise<import('./types').FuturesPositionModeResult>
       setFuturesLeverage: (options: import('./types').FuturesAccountMutation & { leverage: number }) => Promise<import('./types').FuturesConfiguration>
@@ -38,6 +41,7 @@ interface Window {
     }
     agents: {
       create: (definition: import('./types').AgentCreateInput) => Promise<import('./types').AgentDefinition>
+      update: (agentId: string, definition: import('./types').AgentCreateInput, expectedRevision?: number) => Promise<import('./types').AgentDefinition>
       start: (agentId: string) => Promise<import('./types').AgentDefinition>
       pause: (agentId: string) => Promise<import('./types').AgentDefinition>
       evaluateNow: (agentId: string) => Promise<{ evaluated: boolean; reason?: string; candleTime?: number; error?: string }>

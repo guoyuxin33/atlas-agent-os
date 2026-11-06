@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process'
+import { createHmac } from 'node:crypto'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -96,18 +97,123 @@ try {
   process.stderr.write('QA Electron ready\n')
   const {
     adjustFuturesPositionMargin,
+    aggregateOrderTrades,
     buildBinanceSpotSnapshot,
+    calculateServerTimeOffset,
+    cancelOrder,
+    createSignedQuery,
     getAccountSnapshot,
     getFuturesConfiguration,
     getFuturesPositionMode,
+    getOpenOrders,
+    getOrder,
+    getOrders,
     normalizeBinanceOrder,
     placeOrder,
+    resetBinanceNetworkState,
     setFuturesLeverage,
     setFuturesMarginType,
     setFuturesPositionMode,
+    setBinanceRequestFetcherForTests,
+    requestBinanceForTests,
   } = await import('../electron/services/binance.mjs')
   const { ExchangeInfoCatalog } = await import('../electron/services/exchange-info.mjs')
   const { AgentRuntime } = await import('../electron/services/agent-runtime.mjs')
+  const { authorizeAgentMcpTools, buildAgentSupervisorSystem, resolveAgentSkills } = await import('../electron/services/ai.mjs')
+  const { saveVault } = await import('../electron/services/vault.mjs')
+
+  await verify('Binance 签名时间校准与成交聚合', async () => {
+    const offset = calculateServerTimeOffset(10_250, 10_000, 10_100)
+    assert(offset === 200, `服务器时间偏移计算错误: ${offset}`)
+    const signed = createSignedQuery({ symbol: 'BTCUSDT', side: 'BUY' }, { timestamp: 12_345, recvWindow: 5000, apiSecret: 'qa-secret' })
+    const signature = signed.get('signature')
+    signed.delete('signature')
+    const expected = createHmac('sha256', 'qa-secret').update(signed.toString()).digest('hex')
+    assert(signature === expected && signed.get('timestamp') === '12345', 'Binance 请求签名或时间戳错误')
+    const aggregates = aggregateOrderTrades([
+      { orderId: 7, qty: '0.2', quoteQty: '20', realizedPnl: '1.25', commission: '0.01', commissionAsset: 'USDT' },
+      { orderId: 7, qty: '0.3', quoteQty: '33', realizedPnl: '-0.25', commission: '0.02', commissionAsset: 'USDT' },
+    ])
+    const aggregate = aggregates.get('7')
+    assert(almostEqual(aggregate.executedQty, 0.5) && almostEqual(aggregate.quoteQty, 53), '成交数量或成交额聚合错误')
+    assert(almostEqual(aggregate.realizedPnl, 1) && almostEqual(aggregate.commissions.get('USDT'), 0.03), '已实现盈亏或手续费聚合错误')
+    return { offset, realizedPnl: aggregate.realizedPnl, commission: aggregate.commissions.get('USDT') }
+  })
+
+  await verify('Binance REST mock 成交明细、限流熔断与校时重试', async () => {
+    await saveVault('binance-testnet', { apiKey: 'qa-key', apiSecret: 'qa-secret', environment: 'testnet' })
+    const response = (payload, status = 200, headers) => new Response(JSON.stringify(payload), { status, headers: { 'content-type': 'application/json', ...(headers || {}) } })
+
+    let restore = setBinanceRequestFetcherForTests(async (url, options = {}) => {
+      const target = new URL(url)
+      if (target.pathname === '/fapi/v1/time') return response({ serverTime: Date.now() })
+      assert(options.headers?.['X-MBX-APIKEY'] === 'qa-key' && target.searchParams.has('signature'), '签名请求缺少 API Key 或 signature')
+      if (target.pathname === '/fapi/v1/allOrders') return response([{ orderId: 77, symbol: 'BTCUSDT', side: 'SELL', type: 'MARKET', status: 'FILLED', origQty: '0.5', executedQty: '0.5', avgPrice: '0', cumQuote: '53', time: 100 }])
+      if (target.pathname === '/fapi/v1/userTrades') return response([
+        { orderId: 77, qty: '0.2', quoteQty: '20', price: '100', realizedPnl: '1.25', commission: '0.01', commissionAsset: 'USDT' },
+        { orderId: 77, qty: '0.3', quoteQty: '33', price: '110', realizedPnl: '-0.25', commission: '0.02', commissionAsset: 'USDT' },
+      ])
+      throw new Error(`QA unexpected Binance request ${options.method || 'GET'} ${target.pathname}`)
+    })
+    let enriched
+    try {
+      enriched = (await getOrders({ environment: 'testnet', marketType: 'futures', symbol: 'BTCUSDT' }))[0]
+      assert(enriched.realizedPnl === '1' && enriched.commission === '0.03' && enriched.avgPrice === '106', `userTrades 聚合未进入订单: ${JSON.stringify(enriched)}`)
+    } finally {
+      restore()
+    }
+
+    const rateLimitResults = []
+    for (const status of [429, 418]) {
+      let endpointCalls = 0
+      restore = setBinanceRequestFetcherForTests(async (url) => {
+        const target = new URL(url)
+        if (target.pathname === '/api/v3/time') return response({ serverTime: Date.now() })
+        endpointCalls += 1
+        return response({ code: -1003, msg: 'Too many requests' }, status, { 'retry-after': '120' })
+      })
+      try {
+        const requestOptions = { environment: 'testnet', marketType: 'spot', path: '/api/v3/account', signed: true, credentials: { apiKey: 'qa-key', apiSecret: 'qa-secret', environment: 'testnet' } }
+        await expectReject(() => requestBinanceForTests(requestOptions), /暂停 REST 请求|Too many requests/)
+        await expectReject(() => requestBinanceForTests(requestOptions), /暂停 REST 请求/)
+        assert(endpointCalls === 1, `${status} 后仍向 Binance mock 重试了 ${endpointCalls} 次`)
+        resetBinanceNetworkState()
+        await expectReject(() => requestBinanceForTests(requestOptions), /暂停 REST 请求|Too many requests/)
+        assert(endpointCalls === 2, `${status} 后切换网络出口未恢复 REST 探测`)
+        rateLimitResults.push({ status, endpointCalls, resetRecovered: true })
+      } finally {
+        restore()
+      }
+    }
+
+    let postCalls = 0
+    let timeCalls = 0
+    restore = setBinanceRequestFetcherForTests(async (url, options = {}) => {
+      const target = new URL(url)
+      if (target.pathname === '/fapi/v1/time') {
+        timeCalls += 1
+        return response({ serverTime: Date.now() + 250 })
+      }
+      assert(target.pathname === '/fapi/v1/order' && options.method === 'POST', '校时重试访问了非预期接口')
+      postCalls += 1
+      return postCalls === 1 ? response({ code: -1021, msg: 'Timestamp outside recvWindow' }, 400) : response({ orderId: 88, status: 'NEW' })
+    })
+    try {
+      const result = await requestBinanceForTests({
+        environment: 'testnet', marketType: 'futures', path: '/fapi/v1/order', method: 'POST', signed: true,
+        credentials: { apiKey: 'qa-key', apiSecret: 'qa-secret', environment: 'testnet' }, params: { symbol: 'BTCUSDT', side: 'BUY', type: 'MARKET', quantity: '0.001' },
+      })
+      assert(result.orderId === 88 && postCalls === 2 && timeCalls === 2, `-1021 没有完成一次校时重试: ${JSON.stringify({ postCalls, timeCalls })}`)
+    } finally {
+      restore()
+    }
+
+    const cancelReject = await expectReject(
+      () => cancelOrder({ environment: 'live', marketType: 'futures', symbol: 'BTCUSDT', orderId: '99' }),
+      /生产撤单缺少二次确认/,
+    )
+    return { enriched: { realizedPnl: enriched.realizedPnl, commission: enriched.commission, avgPrice: enriched.avgPrice }, rateLimitResults, postCalls, timeCalls, cancelReject }
+  })
 
   await verify('Binance 规则缓存、精度规整与现货可用数量', async () => {
     const exchangeInfo = {
@@ -170,6 +276,8 @@ try {
     assert(almostEqual(state.spot.realizedPnl + unrealizedPnl, 35), '现货当日收益应为 35')
     assert(almostEqual(equity, 25_035), `现货权益应为 25035，实际 ${equity}`)
     assert(almostEqual(state.spot.usdt, 24_920), `现货可用余额应为 24920，实际 ${state.spot.usdt}`)
+    const firstClose = (await getOrders({ environment: 'paper', marketType: 'spot', symbol })).find((order) => order.side === 'SELL')
+    assert(almostEqual(firstClose?.realizedPnl, 20) && firstClose?.avgPrice === '120', `现货订单实际盈亏未记录: ${JSON.stringify(firstClose)}`)
 
     await placeOrder(paperOrder({ symbol, side: 'SELL', quantity: '1', marketPrice: '90' }))
     state = await readPaperState()
@@ -177,6 +285,20 @@ try {
     assert(almostEqual(state.spot.usdt, 25_010), `现货平仓后权益应为 25010，实际 ${state.spot.usdt}`)
     assert(!state.spot.holdings.some((item) => item.symbol === symbol), '现货平仓后仍残留持仓')
     return { realizedPnl: state.spot.realizedPnl, equity: state.spot.usdt, markedUnrealizedPnl: unrealizedPnl }
+  })
+
+  await verify('Paper 挂单查询与撤单', async () => {
+    const symbol = 'QACANCELUSDT'
+    const created = await placeOrder(paperOrder({ symbol, side: 'BUY', type: 'LIMIT', quantity: '1', price: '50', marketPrice: '100', clientOrderId: 'qa_cancel_1' }))
+    assert(created.status === 'NEW', '非市价限价单应保持挂单状态')
+    const open = await getOpenOrders({ environment: 'paper', marketType: 'spot', symbol })
+    assert(open.length === 1 && open[0].clientOrderId === 'qa_cancel_1', '挂单列表缺少新订单')
+    const queried = await getOrder({ environment: 'paper', marketType: 'spot', symbol, clientOrderId: 'qa_cancel_1' })
+    assert(queried.orderId === created.orderId, '按 clientOrderId 查询订单失败')
+    const cancelled = await cancelOrder({ environment: 'paper', marketType: 'spot', symbol, orderId: created.orderId })
+    assert(cancelled.status === 'CANCELED', '模拟撤单状态错误')
+    assert((await getOpenOrders({ environment: 'paper', marketType: 'spot', symbol })).length === 0, '撤单后仍出现在挂单列表')
+    return { orderId: created.orderId, status: cancelled.status }
   })
 
   await verify('Paper futures 多头、空头与只减仓', async () => {
@@ -198,7 +320,8 @@ try {
       () => placeOrder(paperOrder({ symbol: longSymbol, marketType: 'futures', side: 'SELL', quantity: '3', marketPrice: '1100', positionSide: 'BOTH', reduceOnly: true })),
       /只减仓数量不能超过当前持仓/,
     )
-    await placeOrder(paperOrder({ symbol: longSymbol, marketType: 'futures', side: 'SELL', quantity: '1', marketPrice: '1200', positionSide: 'BOTH', reduceOnly: true }))
+    const partialLongClose = await placeOrder(paperOrder({ symbol: longSymbol, marketType: 'futures', side: 'SELL', quantity: '1', marketPrice: '1200', positionSide: 'BOTH', reduceOnly: true }))
+    assert(partialLongClose.realizedPnl === '200' && partialLongClose.avgPrice === '1200', `合约平仓订单实际盈亏未记录: ${JSON.stringify(partialLongClose)}`)
 
     await setFuturesLeverage({ environment: 'paper', symbol: shortSymbol, leverage: 5 })
     await placeOrder(paperOrder({ symbol: shortSymbol, marketType: 'futures', side: 'SELL', quantity: '2', marketPrice: '500', positionSide: 'BOTH' }))
@@ -431,6 +554,306 @@ try {
     assert(submittedLiveOrders === 0, '重启加载期间发生 Live 自动下单')
     await restarted.close()
     return { agents: afterRestart.length, allResumed: true, immediateEvaluation: true, pendingLiveIntents: beforeRestart.find((agent) => agent.id === liveAgent.id).pendingIntents.length, liveAdapterCalls: submittedLiveOrders, stages: requiredStages }
+  })
+
+  await verify('Agent 持仓方向模式、现货降级与反向信号平仓', async () => {
+    const upCandles = [100, 100, 100, 90, 110].map((close, index) => ({ time: index + 1, open: close, high: close + 1, low: close - 1, close, volume: 10 }))
+    const downCandles = [100, 100, 100, 110, 90].map((close, index) => ({ time: index + 1, open: close, high: close + 1, low: close - 1, close, volume: 10 }))
+    const establishedUptrend = [90, 92, 94, 96, 98].map((close, index) => ({ time: index + 1, open: close, high: close + 1, low: close - 1, close, volume: 10 }))
+    const runDirectionCase = async ({ name, marketType = 'futures', positionMode, candles, portfolio = [], exchangePositionMode = 'ONE_WAY' }) => {
+      const submitted = []
+      const runtime = new AgentRuntime({
+        dataDirectory: join(userDataDirectory, `agents-direction-${name}`),
+        marketHub: {
+          subscribeInternal() { return () => {} },
+          async history() { return candles },
+        },
+        placeOrder: async (order) => {
+          submitted.push(order)
+          return { ...order, status: 'FILLED' }
+        },
+        getAccountSnapshot: async () => ({
+          totalWalletBalance: 25_000,
+          availableBalance: portfolio.length ? 0 : 25_000,
+          futuresConfig: { positionMode: exchangePositionMode },
+          portfolio,
+        }),
+        isExecutionHalted: () => false,
+      })
+      const agent = await runtime.create({
+        name: `QA Direction ${name}`,
+        strategy: 'ma-crossover',
+        environment: 'paper',
+        marketType,
+        ...(positionMode ? { positionMode } : {}),
+        symbol: 'BTCUSDT',
+        interval: '1m',
+        params: { maType: 'EMA', fastPeriod: 2, slowPeriod: 3 },
+        risk: { riskFraction: 0.005, maxNotional: 100 },
+      })
+      await runtime.start(agent.id)
+      await waitFor(async () => (await runtime.logs({ agentId: agent.id, limit: 100 })).some((event) => event.type === 'COMPLETED'))
+      const logs = await runtime.logs({ agentId: agent.id, limit: 100 })
+      const state = (await runtime.list()).find((item) => item.id === agent.id)
+      await runtime.pause(agent.id)
+      await runtime.close()
+      return { submitted, logs, state }
+    }
+
+    const autoShort = await runDirectionCase({ name: 'auto-short', positionMode: 'auto', candles: downCandles })
+    assert(autoShort.submitted.length === 1 && autoShort.submitted[0].side === 'SELL', 'AUTO 合约没有按空头信号开空')
+
+    const regimeEntry = await runDirectionCase({ name: 'regime-entry', positionMode: 'auto', candles: establishedUptrend })
+    assert(regimeEntry.submitted.length === 1 && regimeEntry.submitted[0].side === 'BUY', '均线趋势已形成时启动的空仓 Agent 没有建立初始仓位')
+
+    const autoHedgeLong = await runDirectionCase({ name: 'auto-hedge-long', positionMode: 'auto', candles: upCandles, exchangePositionMode: 'HEDGE' })
+    assert(autoHedgeLong.submitted.length === 1 && autoHedgeLong.submitted[0].side === 'BUY' && autoHedgeLong.submitted[0].positionSide === 'LONG', 'AUTO HEDGE 没有使用 BUY + LONG 开多')
+
+    const autoHedgeShort = await runDirectionCase({ name: 'auto-hedge-short', positionMode: 'auto', candles: downCandles, exchangePositionMode: 'HEDGE' })
+    assert(autoHedgeShort.submitted.length === 1 && autoHedgeShort.submitted[0].side === 'SELL' && autoHedgeShort.submitted[0].positionSide === 'SHORT', 'AUTO HEDGE 没有使用 SELL + SHORT 开空')
+
+    const shortOnlyShort = await runDirectionCase({ name: 'short-only-short', positionMode: 'short-only', candles: downCandles })
+    assert(shortOnlyShort.submitted.length === 1 && shortOnlyShort.submitted[0].side === 'SELL', 'SHORT_ONLY 合约没有允许空头开仓')
+
+    const longOnlyFiltered = await runDirectionCase({ name: 'long-only-filter', positionMode: 'long-only', candles: downCandles })
+    assert(longOnlyFiltered.submitted.length === 0 && longOnlyFiltered.logs.some((event) => event.type === 'DIRECTION_FILTERED'), 'LONG_ONLY 没有过滤空头开仓')
+
+    const shortOnlyFiltered = await runDirectionCase({ name: 'short-only-filter', positionMode: 'short-only', candles: upCandles })
+    assert(shortOnlyFiltered.submitted.length === 0 && shortOnlyFiltered.logs.some((event) => event.type === 'DIRECTION_FILTERED'), 'SHORT_ONLY 没有过滤多头开仓')
+
+    const longPosition = { symbol: 'BTCUSDT', marketType: 'futures', side: 'LONG', positionSide: 'BOTH', quantity: '2', positionAmt: '2' }
+    const longOnlyClose = await runDirectionCase({ name: 'long-only-close', positionMode: 'long-only', candles: downCandles, portfolio: [longPosition] })
+    assert(longOnlyClose.submitted.length === 1 && longOnlyClose.submitted[0].side === 'SELL' && longOnlyClose.submitted[0].reduceOnly === true, 'LONG_ONLY 阻止了反向信号平多')
+
+    const shortPosition = { symbol: 'BTCUSDT', marketType: 'futures', side: 'SHORT', positionSide: 'BOTH', quantity: '2', positionAmt: '-2' }
+    const shortOnlyClose = await runDirectionCase({ name: 'short-only-close', positionMode: 'short-only', candles: upCandles, portfolio: [shortPosition] })
+    assert(shortOnlyClose.submitted.length === 1 && shortOnlyClose.submitted[0].side === 'BUY' && shortOnlyClose.submitted[0].reduceOnly === true, 'SHORT_ONLY 阻止了反向信号平空')
+
+    const spotForcedLong = await runDirectionCase({ name: 'spot-forced-long', marketType: 'spot', positionMode: 'short-only', candles: downCandles })
+    assert(spotForcedLong.state.positionMode === 'long-only', `现货 Agent 未强制 long-only：${spotForcedLong.state.positionMode}`)
+    assert(spotForcedLong.submitted.length === 0 && spotForcedLong.logs.some((event) => event.type === 'DIRECTION_FILTERED'), '现货 Agent 对空头信号发生了裸卖空')
+
+    const legacyFutures = await runDirectionCase({ name: 'legacy-futures-default', candles: upCandles })
+    assert(legacyFutures.state.positionMode === 'auto', `旧合约 Agent 默认模式不是 auto：${legacyFutures.state.positionMode}`)
+
+    return {
+      autoShortSide: autoShort.submitted[0].side,
+      regimeEntrySide: regimeEntry.submitted[0].side,
+      autoHedgeLong: { side: autoHedgeLong.submitted[0].side, positionSide: autoHedgeLong.submitted[0].positionSide },
+      autoHedgeShort: { side: autoHedgeShort.submitted[0].side, positionSide: autoHedgeShort.submitted[0].positionSide },
+      shortOnlyShortSide: shortOnlyShort.submitted[0].side,
+      longOnlyFilteredOrders: longOnlyFiltered.submitted.length,
+      shortOnlyFilteredOrders: shortOnlyFiltered.submitted.length,
+      longOnlyClose: { side: longOnlyClose.submitted[0].side, reduceOnly: longOnlyClose.submitted[0].reduceOnly },
+      shortOnlyClose: { side: shortOnlyClose.submitted[0].side, reduceOnly: shortOnlyClose.submitted[0].reduceOnly },
+      spotEffectiveMode: spotForcedLong.state.positionMode,
+      futuresLegacyMode: legacyFutures.state.positionMode,
+    }
+  })
+
+  await verify('Agent 编辑版本保护、旧意图失效与重启持久化', async () => {
+    const directory = join(userDataDirectory, 'agents-update-qa')
+    const callbacks = new Map()
+    const candles = [100, 100, 100, 90, 110].map((close, index) => ({
+      time: index + 1,
+      open: close,
+      high: close + 1,
+      low: close - 1,
+      close,
+      volume: 10,
+    }))
+    const marketHub = {
+      subscribeInternal(options, callback) {
+        callbacks.set(options.symbol, callback)
+        return () => callbacks.delete(options.symbol)
+      },
+      async history() { return candles },
+    }
+    let adapterCalls = 0
+    const runtime = new AgentRuntime({
+      dataDirectory: directory,
+      marketHub,
+      placeOrder: async () => { adapterCalls += 1; throw new Error('旧 Live 意图不得提交') },
+      getAccountSnapshot: async () => ({ totalWalletBalance: 25_000, availableBalance: 25_000, futuresConfig: { positionMode: 'ONE_WAY' }, portfolio: [] }),
+      isExecutionHalted: () => false,
+    })
+    const created = await runtime.create({
+      name: 'QA Editable Agent', strategy: 'ma-crossover', environment: 'live', marketType: 'futures', positionMode: 'auto', symbol: 'BTCUSDT', interval: '1m',
+      params: { maType: 'EMA', fastPeriod: 2, slowPeriod: 3 }, risk: { riskFraction: 0.005, maxNotional: 100 },
+    })
+    assert(created.revision === 1, '新 Agent 配置版本不是 1')
+    await runtime.start(created.id)
+    await waitFor(async () => (await runtime.list()).find((agent) => agent.id === created.id)?.pendingIntents?.length === 1)
+    const oldIntent = (await runtime.list()).find((agent) => agent.id === created.id).pendingIntents[0]
+    const updated = await runtime.update(created.id, {
+      name: 'QA Editable Agent v2', strategy: 'ma-crossover', environment: 'paper', marketType: 'futures', positionMode: 'short-only', symbol: 'ETHUSDT', interval: '5m',
+      params: { maType: 'EMA', fastPeriod: 3, slowPeriod: 8 }, risk: { riskFraction: 0.004, maxNotional: 200 },
+    }, created.revision)
+    assert(updated.revision === 2 && updated.status === 'paused', '编辑后没有递增版本并保持暂停')
+    assert(updated.symbol === 'ETHUSDT' && updated.positionMode === 'short-only', '编辑字段没有落盘')
+    assert(!callbacks.has('BTCUSDT'), '编辑运行中 Agent 后旧订阅仍存在')
+    assert((await runtime.list()).find((agent) => agent.id === created.id).pendingIntents.length === 0, '编辑后旧生产意图仍可见')
+    await expectReject(() => runtime.confirmIntent(oldIntent.id), /已处理|配置已更新/)
+    await expectReject(() => runtime.update(created.id, {
+      name: 'Stale overwrite', strategy: 'ma-crossover', environment: 'paper', marketType: 'futures', positionMode: 'auto', symbol: 'SOLUSDT', interval: '1m',
+    }, created.revision), /其他操作更新/)
+    const logs = await runtime.logs({ agentId: created.id, limit: 100 })
+    assert(logs.some((event) => event.type === 'agent.updated') && logs.some((event) => event.type === 'INTENT_INVALIDATED'), '编辑审计日志不完整')
+    await runtime.close()
+
+    const restarted = new AgentRuntime({
+      dataDirectory: directory,
+      marketHub,
+      placeOrder: async () => { adapterCalls += 1; throw new Error('暂停 Agent 不得提交') },
+      getAccountSnapshot: async () => ({ totalWalletBalance: 25_000, availableBalance: 25_000, portfolio: [] }),
+      isExecutionHalted: () => false,
+    })
+    const restored = (await restarted.list()).find((agent) => agent.id === created.id)
+    assert(restored.revision === 2 && restored.status === 'paused' && restored.symbol === 'ETHUSDT', '重启后没有恢复编辑结果')
+    await restarted.close()
+    assert(adapterCalls === 0, `编辑/重启路径意外调用下单适配器 ${adapterCalls} 次`)
+    return { revision: restored.revision, status: restored.status, symbol: restored.symbol, invalidatedIntent: oldIntent.id, adapterCalls }
+  })
+
+  await verify('Agent AI 监督批准、拒绝、故障关闭与 Live 待确认', async () => {
+    const skillSystem = buildAgentSupervisorSystem(['risk-review'])
+    const riskSkill = resolveAgentSkills(['risk-review'])[0]
+    assert(skillSystem.includes(`[受信任 Skill risk-review@${riskSkill.version}]`) && skillSystem.includes(riskSkill.instructions), '受信任 Skill 的完整版本化指令没有注入监督 system')
+    await expectReject(async () => resolveAgentSkills(['front-end-injected-instructions']), /未知 Skill/)
+    const discoveredMcp = [{ url: 'https://mcp.example.test/rpc', tools: [{ name: 'market.read' }, { name: 'orders.submit' }] }]
+    assert(authorizeAgentMcpTools(discoveredMcp, [])[0].tools.length === 0, '空 MCP 白名单不应向模型暴露任何工具')
+    const authorizedMcp = authorizeAgentMcpTools(discoveredMcp, ['market.read'])
+    assert(authorizedMcp[0].tools.length === 1 && authorizedMcp[0].tools[0].name === 'market.read', 'MCP 工具白名单没有精确过滤')
+    await expectReject(async () => authorizeAgentMcpTools(discoveredMcp, ['unknown.tool']), /未提供的工具/)
+    const crossingCandles = [100, 100, 100, 90, 110].map((close, index) => ({
+      time: index + 1,
+      open: close,
+      high: close + 1,
+      low: close - 1,
+      close,
+      volume: 10,
+    }))
+    const runCase = async ({ name, superviseCandidate, environment = 'paper', marketType = 'spot', confidenceThreshold = 0.7, aiTimeoutMs = 500 }) => {
+      const submitted = []
+      const marketHub = {
+        subscribeInternal() { return () => {} },
+        async history() { return crossingCandles },
+      }
+      const runtime = new AgentRuntime({
+        dataDirectory: join(userDataDirectory, `agents-ai-${name}`),
+        marketHub,
+        superviseCandidate,
+        aiTimeoutMs,
+        placeOrder: async (order) => {
+          submitted.push(order)
+          return { ...order, status: 'FILLED' }
+        },
+        getAccountSnapshot: async () => ({
+          totalWalletBalance: 25_000,
+          availableBalance: 25_000,
+          futuresConfig: { positionMode: 'ONE_WAY' },
+          portfolio: [],
+        }),
+        isExecutionHalted: () => false,
+      })
+      const agent = await runtime.create({
+        name: `QA AI ${name}`,
+        strategy: 'ma-crossover',
+        environment,
+        marketType,
+        symbol: 'BTCUSDT',
+        interval: '1m',
+        params: { maType: 'EMA', fastPeriod: 2, slowPeriod: 3 },
+        risk: { riskFraction: 0.005, maxNotional: 100 },
+        intelligence: {
+          mode: 'ai-supervised',
+          model: 'qa-model',
+          skills: ['risk-review'],
+          mcpServers: ['https://mcp.example.test/rpc'],
+          mcpTools: ['market.read'],
+          confidenceThreshold,
+          failClosed: false,
+        },
+      })
+      await runtime.start(agent.id)
+      await waitFor(async () => (await runtime.logs({ agentId: agent.id, limit: 100 })).some((event) => event.type === 'COMPLETED'))
+      const logs = await runtime.logs({ agentId: agent.id, limit: 100 })
+      const state = (await runtime.list()).find((item) => item.id === agent.id)
+      await runtime.pause(agent.id)
+      await runtime.close()
+      return { submitted, logs, state }
+    }
+
+    let frozenCandidate
+    const approved = await runCase({
+      name: 'approved',
+      superviseCandidate: async (request) => {
+        frozenCandidate = structuredClone(request.candidateOrder)
+        return { decision: 'APPROVE', confidence: 0.96, reason: '趋势与风险条件一致', side: 'SELL', quantity: '999999' }
+      },
+    })
+    for (const stage of ['AI_CONTEXT_READY', 'AI_REASONING', 'AI_APPROVED']) {
+      assert(approved.logs.some((event) => event.type === stage), `AI 批准路径缺少阶段 ${stage}`)
+    }
+    assert(approved.submitted.length === 1, `AI 批准后应提交一笔 Paper 订单，实际 ${approved.submitted.length}`)
+    assert(approved.submitted[0].side === frozenCandidate.side && approved.submitted[0].quantity === frozenCandidate.quantity, 'AI 返回的订单篡改字段影响了确定性候选单')
+
+    const rejected = await runCase({
+      name: 'rejected',
+      superviseCandidate: async () => ({ decision: 'REJECT', confidence: 0.91, reason: '市场条件不足' }),
+    })
+    assert(rejected.logs.some((event) => event.type === 'AI_REJECTED') && rejected.submitted.length === 0, 'AI 明确拒绝后仍提交了订单')
+
+    const lowConfidence = await runCase({
+      name: 'low-confidence',
+      confidenceThreshold: 0.8,
+      superviseCandidate: async () => ({ decision: 'APPROVE', confidence: 0.79, reason: '证据强度不足' }),
+    })
+    assert(lowConfidence.logs.some((event) => event.type === 'AI_REJECTED' && event.data?.rejectionReason === 'LOW_CONFIDENCE'), '低置信度批准没有被拒绝')
+    assert(lowConfidence.submitted.length === 0, '低置信度批准后仍提交了订单')
+
+    const malformed = await runCase({
+      name: 'malformed',
+      superviseCandidate: async () => ({ decision: 'MAYBE', confidence: 0.9, reason: 'invalid' }),
+    })
+    assert(malformed.logs.some((event) => event.type === 'AI_FAILED') && malformed.logs.some((event) => event.type === 'AI_REJECTED'), '非法 AI 响应没有 fail-closed')
+    assert(malformed.submitted.length === 0, '非法 AI 响应后仍提交了订单')
+
+    const timedOut = await runCase({
+      name: 'timeout',
+      aiTimeoutMs: 100,
+      superviseCandidate: async () => new Promise(() => {}),
+    })
+    assert(timedOut.logs.some((event) => event.type === 'AI_FAILED' && /超时/.test(event.message)), 'AI 超时没有记录失败阶段')
+    assert(timedOut.submitted.length === 0, 'AI 超时后仍提交了订单')
+
+    const mcpFailed = await runCase({
+      name: 'mcp-failed',
+      superviseCandidate: async () => { throw new Error('MCP unavailable') },
+    })
+    assert(mcpFailed.logs.some((event) => event.type === 'AI_FAILED' && /MCP unavailable/.test(event.message)), 'MCP 故障没有进入 AI_FAILED')
+    assert(mcpFailed.submitted.length === 0, 'MCP 故障后仍提交了订单')
+
+    const liveApproved = await runCase({
+      name: 'live-approved',
+      environment: 'live',
+      marketType: 'futures',
+      superviseCandidate: async () => ({ decision: 'APPROVE', confidence: 0.98, reason: '允许创建待确认意图' }),
+    })
+    assert(liveApproved.logs.some((event) => event.type === 'AI_APPROVED'), 'Live AI 批准阶段缺失')
+    assert(liveApproved.state.pendingIntents?.length === 1, 'Live AI 批准后没有创建唯一待确认意图')
+    assert(liveApproved.submitted.length === 0, 'Live AI 批准后在人工确认前调用了下单适配器')
+
+    return {
+      approvedPaperOrders: approved.submitted.length,
+      rejectedOrders: rejected.submitted.length,
+      lowConfidenceOrders: lowConfidence.submitted.length,
+      malformedOrders: malformed.submitted.length,
+      timeoutOrders: timedOut.submitted.length,
+      mcpFailureOrders: mcpFailed.submitted.length,
+      livePendingIntents: liveApproved.state.pendingIntents.length,
+      liveAdapterCalls: liveApproved.submitted.length,
+    }
   })
 
   await verify('Agent 失败重试、HEDGE 平仓与生产确认互斥', async () => {

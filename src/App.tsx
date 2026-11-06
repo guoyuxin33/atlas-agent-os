@@ -40,7 +40,7 @@ import { MarketSelector } from './components/MarketSelector'
 import { Modal } from './components/Modal'
 import { OrdersView, ReviewView, StrategiesView } from './components/OperationsViews'
 import { SkillsView } from './components/SkillsView'
-import { riskRules } from './data'
+import { MarketEnvironmentContext } from './contexts/MarketEnvironmentContext'
 import { useMarketData } from './hooks/useMarketData'
 import { getVaultStatus, saveSecrets } from './lib/desktop'
 import { getModelProvider, modelProviders } from './modelProviders'
@@ -49,6 +49,15 @@ import type { AccountSnapshot, AgentCreateInput, AgentDefinition, AgentEvent, Ag
 
 type NavId = 'overview' | 'assistant' | 'agents' | 'strategies' | 'skills' | 'connections' | 'risk' | 'orders' | 'review'
 type ModalId = 'exchange' | 'model' | 'network' | 'agent' | 'emergency' | 'notifications' | null
+
+interface AppNotification {
+  id: string
+  title: string
+  detail: string
+  timestamp?: number
+  navigateTo: NavId
+  tone: 'warning' | 'healthy'
+}
 
 const navigation: Array<{ id: NavId; label: string; icon: typeof LayoutDashboard; group: 'run' | 'control' }> = [
   { id: 'overview', label: '工作台', icon: LayoutDashboard, group: 'run' },
@@ -76,6 +85,15 @@ function formatPrice(value: number) {
 function formatQuantity(value: number) {
   if (!(value > 0)) return '--'
   return new Intl.NumberFormat('en-US', { maximumFractionDigits: 6 }).format(value)
+}
+
+function relativeTime(timestamp?: number) {
+  if (!timestamp) return '当前状态'
+  const elapsed = Math.max(0, Date.now() - timestamp)
+  if (elapsed < 60_000) return '刚刚'
+  if (elapsed < 60 * 60_000) return `${Math.floor(elapsed / 60_000)} 分钟前`
+  if (elapsed < 24 * 60 * 60_000) return `${Math.floor(elapsed / (60 * 60_000))} 小时前`
+  return new Date(timestamp).toLocaleDateString('zh-CN')
 }
 
 function StatusDot({ live = false, danger = false }: { live?: boolean; danger?: boolean }) {
@@ -132,23 +150,30 @@ function Sidebar({ active, onNavigate, open, onClose, environment, binanceConfig
   )
 }
 
-function Topbar({ environment, marketType, onEnvironment, onMarketType, onMenu, onModal, onSearch, onAccount }: {
+function Topbar({ environment, marketType, refreshing, lastRefreshedAt, notificationCount, onEnvironment, onMarketType, onMenu, onModal, onSearch, onRefresh, onAccount }: {
   environment: Environment
   marketType: MarketType
+  refreshing: boolean
+  lastRefreshedAt: number | null
+  notificationCount: number
   onEnvironment: (value: Environment) => void
   onMarketType: (value: MarketType) => void
   onMenu: () => void
   onModal: (id: ModalId) => void
   onSearch: () => void
+  onRefresh: () => void
   onAccount: () => void
 }) {
+  const refreshTitle = lastRefreshedAt
+    ? `刷新账户、订单、行情和 Agent（上次 ${new Date(lastRefreshedAt).toLocaleTimeString('zh-CN', { hour12: false })}）`
+    : '刷新账户、订单、行情和 Agent'
   return (
     <header className="topbar">
       <button className="menu-button" onClick={onMenu} aria-label="打开导航"><Menu size={19} /></button>
       <button className="command-search" onClick={onSearch}><Search size={16} /><span>搜索页面或操作</span><kbd>⌘ K</kbd></button>
       <div className="topbar-mode segmented compact" aria-label="市场类型"><button className={marketType === 'spot' ? 'active' : ''} onClick={() => onMarketType('spot')}>现货</button><button className={marketType === 'futures' ? 'active' : ''} onClick={() => onMarketType('futures')}>永续</button></div>
       <div className="environment-switch segmented compact" aria-label="账户环境">{(['paper', 'testnet', 'live'] as Environment[]).map((value) => <button key={value} className={`${environment === value ? 'active' : ''} ${value === 'live' ? 'live-mode' : ''}`} onClick={() => onEnvironment(value)}>{environmentLabel(value)}</button>)}</div>
-      <div className="topbar-actions"><button className="icon-button notification-button" onClick={() => onModal('notifications')} aria-label="通知"><Bell size={18} /><span /></button><button className="avatar-button" onClick={onAccount} aria-label="账户菜单">YX</button></div>
+      <div className="topbar-actions"><button className="icon-button refresh-all-button" onClick={onRefresh} disabled={refreshing} aria-label={refreshing ? '正在刷新实时数据' : '刷新全部实时数据'} aria-busy={refreshing} title={refreshing ? '正在刷新账户、订单、行情和 Agent' : refreshTitle}><RefreshCw className={refreshing ? 'spin' : ''} size={17} /></button><button className="icon-button notification-button" onClick={() => onModal('notifications')} aria-label={notificationCount ? `通知，${notificationCount} 条待处理` : '通知，无待处理事项'}><Bell size={18} />{notificationCount > 0 && <span />}</button><button className="avatar-button" onClick={onAccount} aria-label="账户菜单">YX</button></div>
     </header>
   )
 }
@@ -230,11 +255,12 @@ function ClosePositionModal({ environment, position, halted, onClose, onSubmit }
   return <Modal title={`平仓 ${position.symbol}`} subtitle={`${environmentLabel(environment)} · ${position.marketType === 'spot' ? '现货卖出' : `${position.positionSide || 'BOTH'} ${position.side === 'LONG' ? '平多' : '平空'}`}`} onClose={onClose}><div className="close-position-form"><div className="close-position-summary"><span>{position.marketType === 'spot' && environment !== 'paper' ? '总持仓 / 可用' : '当前持仓'}<strong>{position.marketType === 'spot' && environment !== 'paper' ? `${totalQuantity.toLocaleString('en-US', { maximumFractionDigits: 8 })} / ` : ''}{maxQuantity.toLocaleString('en-US', { maximumFractionDigits: 8 })} {baseAsset}</strong></span><span>标记价格<strong>{markPrice > 0 ? `$${formatPrice(markPrice)}` : '--'}</strong></span><span>未实现盈亏<strong className={Number(position.unrealizedPnl) >= 0 ? 'text-positive' : 'text-negative'}>{Number(position.unrealizedPnl) >= 0 ? '+' : ''}${Number(position.unrealizedPnl || 0).toFixed(2)}</strong></span></div><label className="field-label">订单类型</label><div className="segmented order-type"><button className={orderType === 'MARKET' ? 'active' : ''} onClick={() => setOrderType('MARKET')}>市价</button><button className={orderType === 'LIMIT' ? 'active' : ''} onClick={() => setOrderType('LIMIT')}>限价</button></div><label className="field-label" htmlFor="close-amount">平仓数量</label><div className="input-shell"><input id="close-amount" value={amount} onChange={(event) => { setAmount(event.target.value); setError(null) }} inputMode="decimal" /><span>{baseAsset}</span></div><div className="amount-presets">{[0.25, 0.5, 0.75, 1].map((ratio) => <button key={ratio} onClick={() => applyRatio(ratio)}>{ratio === 1 ? position.marketType === 'spot' && environment !== 'paper' ? '全部可用' : '全部' : `${ratio * 100}%`}</button>)}</div>{orderType === 'LIMIT' && <><label className="field-label" htmlFor="close-price">委托价格</label><div className="input-shell"><input id="close-price" value={price} onChange={(event) => { setPrice(event.target.value); setError(null) }} inputMode="decimal" /><span>USDT</span></div></>}<div className="order-summary"><span>预计价值</span><strong>{Number.isFinite(estimatedValue) && estimatedValue > 0 ? `$${estimatedValue.toFixed(2)}` : '--'}</strong><span>平仓方向</span><strong>{side === 'SELL' ? 'SELL' : 'BUY'}{isHedgePosition ? ` · ${position.positionSide}` : position.marketType === 'futures' ? ' · Reduce Only' : ''}</strong></div>{error && <p className="form-error">{error}</p>}<div className="modal-actions"><button className="secondary-button" onClick={onClose}>取消</button><button className="danger-button" disabled={halted || submitting || !(maxQuantity > 0)} onClick={submit}>{halted ? '执行已停止' : !(maxQuantity > 0) ? '没有可用数量' : submitting ? '提交中' : environment === 'live' ? '进入生产确认' : orderType === 'MARKET' ? '确认市价平仓' : '提交限价平仓'}</button></div></div></Modal>
 }
 
-function Overview({ environment, marketType, symbol, interval, account, tick, book, halted, agents, agentLogs, agentsLoading, busyAgentIds, onSymbol, onInterval, onModal, onToggleAgent, onManageAgents, onPlaceOrder, onRefreshAccount, onToast }: {
+function Overview({ environment, marketType, symbol, interval, marketRefreshKey, account, tick, book, halted, agents, agentLogs, agentsLoading, busyAgentIds, onSymbol, onInterval, onModal, onToggleAgent, onManageAgents, onPlaceOrder, onRefreshAccount, onToast }: {
   environment: Environment
   marketType: MarketType
   symbol: string
   interval: MarketInterval
+  marketRefreshKey: number
   account: AccountSnapshot | null
   tick: MarketTick
   book: MarketBook
@@ -249,7 +275,7 @@ function Overview({ environment, marketType, symbol, interval, account, tick, bo
   onToggleAgent: (agent: AgentDefinition) => Promise<void>
   onManageAgents: () => void
   onPlaceOrder: (order: TradingOrder) => Promise<boolean>
-  onRefreshAccount: () => Promise<void>
+  onRefreshAccount: () => Promise<boolean>
   onToast: (message: string) => void
 }) {
   const [orderSide, setOrderSide] = useState<'BUY' | 'SELL'>('BUY')
@@ -377,7 +403,7 @@ function Overview({ environment, marketType, symbol, interval, account, tick, bo
       <section className="page-heading"><div><div className="heading-eyebrow"><StatusDot live={!halted} />{halted ? '所有执行已停止' : '系统运行正常'}<span>{environmentLabel(environment)} · {marketType === 'spot' ? '现货' : 'USDT 永续'}</span></div><h1>交易工作台</h1><p>共享 WebSocket 行情、账户收益和订单执行在同一条风险边界内</p></div><div className="heading-actions"><button className="secondary-button" onClick={() => onModal('exchange')}><Cable size={16} />连接交易所</button><button className="primary-button" onClick={() => onModal('agent')}><Plus size={16} />新建 Agent</button></div></section>
       <section className="metrics-strip"><Metric label="账户权益" value={`$${equity.toLocaleString('en-US', { maximumFractionDigits: 2 })}`} detail={account?.source === 'binance' ? 'Binance 实时账户' : '本地模拟资金'} /><Metric label="今日盈亏" value={`${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`} detail={`未实现盈亏 ${Number(account?.unrealizedPnl || 0).toFixed(2)}`} tone={pnl >= 0 ? 'positive' : 'negative'} /><Metric label="可用余额" value={`$${balance.toLocaleString('en-US', { maximumFractionDigits: 2 })}`} detail={`${account?.positions.length || 0} 个合约持仓`} tone="accent" /><Metric label="运行中 Agent" value={`${halted ? 0 : agents.filter((agent) => agent.status === 'running').length} / ${agents.length}`} detail={halted ? '总闸已关闭' : '逐笔通过风险规则'} /></section>
       <section className="dashboard-grid">
-        <article className="panel market-panel"><header className="panel-header market-header"><div className="market-title"><span className="asset-mark">{baseAsset.slice(0, 1)}</span><div><MarketSelector marketType={marketType} value={symbol} onChange={onSymbol} /><span>{marketType === 'spot' ? '现货' : 'USDT 永续'} · Binance</span></div></div><div className="market-price"><strong>{tick.price > 0 ? `$${formatPrice(tick.price)}` : '--'}</strong><span className={tick.change >= 0 ? 'text-positive' : 'text-negative'}>{tick.connected ? `${tick.change >= 0 ? '+' : ''}${tick.change.toFixed(2)}%` : '等待行情'}</span></div><div className="market-stat"><span>24h 高</span><strong>{formatPrice(tick.high)}</strong></div><div className="market-stat"><span>24h 低</span><strong>{formatPrice(tick.low)}</strong></div><div className="market-connection"><StatusDot live={tick.connected} />{tick.connected ? '实时' : '重连中'}</div></header><div className="chart-toolbar"><div className="segmented compact">{intervals.map((item) => <button key={item} className={interval === item ? 'active' : ''} onClick={() => onInterval(item)}>{item === '1d' ? '1D' : item}</button>)}</div><div className="chart-market-tools"><div className="best-book" aria-label={`${symbol} 最优买卖盘口`}><span><i>买一</i><strong className="text-positive">{formatPrice(book.bid)}</strong><small>{formatQuantity(book.bidSize)} {baseAsset}</small></span><span><i>卖一</i><strong className="text-negative">{formatPrice(book.ask)}</strong><small>{formatQuantity(book.askSize)} {baseAsset}</small></span></div><button className={`bare-button ${showMA ? 'indicator-active' : ''}`} onClick={() => setShowMA((value) => !value)}><SlidersHorizontal size={15} />MA20</button></div></div><MarketChart marketType={marketType} symbol={symbol} interval={interval} showMA={showMA} /></article>
+      <article className="panel market-panel"><header className="panel-header market-header"><div className="market-title"><span className="asset-mark">{baseAsset.slice(0, 1)}</span><div><MarketSelector marketType={marketType} value={symbol} onChange={onSymbol} /><span>{marketType === 'spot' ? '现货' : 'USDT 永续'} · Binance</span></div></div><div className="market-price"><strong>{tick.price > 0 ? `$${formatPrice(tick.price)}` : '--'}</strong><span className={tick.change >= 0 ? 'text-positive' : 'text-negative'}>{tick.connected ? `${tick.change >= 0 ? '+' : ''}${tick.change.toFixed(2)}%` : '等待行情'}</span></div><div className="market-stat"><span>24h 高</span><strong>{formatPrice(tick.high)}</strong></div><div className="market-stat"><span>24h 低</span><strong>{formatPrice(tick.low)}</strong></div><div className="market-connection"><StatusDot live={tick.connected} />{tick.connected ? '实时' : '重连中'}</div></header><div className="chart-toolbar"><div className="segmented compact">{intervals.map((item) => <button key={item} className={interval === item ? 'active' : ''} onClick={() => onInterval(item)}>{item === '1d' ? '1D' : item}</button>)}</div><div className="chart-market-tools"><div className="best-book" aria-label={`${symbol} 最优买卖盘口`}><span><i>买一</i><strong className="text-positive">{formatPrice(book.bid)}</strong><small>{formatQuantity(book.bidSize)} {baseAsset}</small></span><span><i>卖一</i><strong className="text-negative">{formatPrice(book.ask)}</strong><small>{formatQuantity(book.askSize)} {baseAsset}</small></span></div><button className={`bare-button ${showMA ? 'indicator-active' : ''}`} onClick={() => setShowMA((value) => !value)}><SlidersHorizontal size={15} />MA20</button></div></div><MarketChart marketType={marketType} symbol={symbol} interval={interval} showMA={showMA} refreshKey={marketRefreshKey} /></article>
         <aside className="panel order-panel">
           <header className="panel-header"><div><h2>快速下单</h2><p>{environmentLabel(environment)} · {marketType === 'spot' ? '现货' : '永续合约'}</p></div><LockKeyhole size={17} /></header>
           <div className="segmented order-side"><button className={orderSide === 'BUY' ? 'active buy-active' : ''} onClick={() => setOrderSide('BUY')}>{marketType === 'spot' ? '买入' : positionMode === 'HEDGE' ? positionSide === 'LONG' ? '开多' : '平空' : reduceOnly ? '平空' : '做多'}</button><button className={orderSide === 'SELL' ? 'active sell-active' : ''} onClick={() => setOrderSide('SELL')}>{marketType === 'spot' ? '卖出' : positionMode === 'HEDGE' ? positionSide === 'LONG' ? '平多' : '开空' : reduceOnly ? '平多' : '做空'}</button></div>
@@ -453,8 +479,25 @@ function HoldingsTable({ account, marketType }: { account: AccountSnapshot | nul
   return <div className="table-empty"><WalletCards size={22} /><strong>{account ? '当前没有持仓' : '账户数据尚未载入'}</strong><p>{marketType === 'futures' ? '建立合约仓位后会显示方向、均价和实时盈亏' : '非零现货资产会显示在这里'}</p></div>
 }
 
-function RiskView({ halted, account, marketType, onEmergency, onToast }: { halted: boolean; account: AccountSnapshot | null; marketType: MarketType; onEmergency: () => void; onToast: (message: string) => void }) {
-  return <main className="page"><section className="page-heading"><div><span className="section-kicker">执行前强制检查</span><h1>风险控制</h1><p>规则在 Agent 和交易所之间执行，模型无法绕过</p></div><button className={`emergency-button ${halted ? 'is-halted' : ''}`} onClick={onEmergency}><AlertOctagon size={17} />{halted ? '恢复执行' : '紧急停止'}</button></section><section className={`gate-status ${halted ? 'gate-stopped' : ''}`}><div className="gate-rail"><span /></div><div className="gate-copy"><span className="gate-icon"><ShieldCheck size={22} /></span><div><h2>{halted ? '风控总闸已关闭' : '风控总闸运行中'}</h2><p>{halted ? 'Agent 可以继续分析，但所有新订单都会被拒绝' : '所有订单必须逐项通过规则后才能提交到交易所'}</p></div></div><div className="gate-stats"><div><span>今日检查</span><strong>184</strong></div><div><span>已拒绝</span><strong className="text-negative">7</strong></div><div><span>实时盈亏</span><strong className={Number(account?.unrealizedPnl || 0) >= 0 ? 'text-positive' : 'text-negative'}>{Number(account?.unrealizedPnl || 0).toFixed(2)}</strong></div></div></section><section className="rule-grid">{riskRules.map((rule) => <article className="rule-card" key={rule.name}><header><Gauge size={17} /><span className={rule.state.includes('触发') ? 'warning-label' : 'healthy-label'}>{rule.state}</span></header><h3>{rule.name}</h3><strong>{rule.value}</strong><p>{rule.detail}</p><button className="icon-button" onClick={() => onToast(`${rule.name} 参数已载入`)} aria-label={`配置${rule.name}`}><Settings2 size={16} /></button></article>)}</section><section className="panel exposure-panel"><header className="panel-header"><div><h2>{marketType === 'spot' ? '现货资产' : '当前持仓敞口'}</h2><p>按账户最新快照计算</p></div><span className="quiet-chip">{account?.source === 'binance' ? 'Binance 实时' : '模拟数据'}</span></header><HoldingsTable account={account} marketType={marketType} /></section></main>
+function RiskView({ halted, account, marketType, agents, logs, onEmergency }: { halted: boolean; account: AccountSnapshot | null; marketType: MarketType; agents: AgentDefinition[]; logs: AgentEvent[]; onEmergency: () => void }) {
+  const todayStart = new Date()
+  todayStart.setHours(0, 0, 0, 0)
+  const todayLogs = logs.filter((event) => event.timestamp >= todayStart.getTime())
+  const checks = todayLogs.filter((event) => event.type === 'RISK_CHECKING').length
+  const rejected = todayLogs.filter((event) => ['RISK_REJECTED', 'AI_REJECTED', 'REJECTED'].includes(event.type)).length
+  const equity = Number(account?.totalWalletBalance || 0)
+  const grossExposure = (account?.portfolio || []).reduce((sum, position) => sum + Math.abs(Number(position.notional || position.marketValue || 0)), 0)
+  const exposureRate = equity > 0 ? grossExposure / equity : 0
+  const maxRiskFraction = agents.reduce((maximum, agent) => Math.max(maximum, Number(agent.risk.riskFraction) || 0), 0)
+  const maxNotional = agents.reduce((maximum, agent) => Math.max(maximum, Number(agent.risk.maxNotional) || 0), 0)
+  const pendingLiveIntents = agents.reduce((sum, agent) => sum + (agent.pendingIntents?.filter((intent) => intent.status === 'pending').length || 0), 0)
+  const rules = [
+    { name: 'Agent 单笔风险', value: agents.length ? `${(maxRiskFraction * 100).toFixed(2)}%` : '--', state: '后端强制', detail: agents.length ? `${agents.length} 个 Agent 中的最高配置，上限 1% 净值` : '创建 Agent 后显示最高配置' },
+    { name: 'Agent 名义上限', value: agents.length ? `$${maxNotional.toLocaleString('en-US', { maximumFractionDigits: 2 })}` : '--', state: '逐单校验', detail: '开仓订单在主进程再次检查' },
+    { name: '当前总敞口', value: account ? `${(exposureRate * 100).toFixed(2)}%` : '--', state: '实时计算', detail: account ? `$${grossExposure.toLocaleString('en-US', { maximumFractionDigits: 2 })} / 权益 $${equity.toLocaleString('en-US', { maximumFractionDigits: 2 })}` : '等待账户快照' },
+    { name: '生产待确认', value: String(pendingLiveIntents), state: pendingLiveIntents ? '需要处理' : '当前为零', detail: '生产 Agent 意图必须在 30 秒内逐笔确认' },
+  ]
+  return <main className="page"><section className="page-heading"><div><span className="section-kicker">执行前强制检查</span><h1>风险控制</h1><p>规则在 Agent 和交易所之间执行，模型无法绕过</p></div><button className={`emergency-button ${halted ? 'is-halted' : ''}`} onClick={onEmergency}><AlertOctagon size={17} />{halted ? '恢复执行' : '紧急停止'}</button></section><section className={`gate-status ${halted ? 'gate-stopped' : ''}`}><div className="gate-rail"><span /></div><div className="gate-copy"><span className="gate-icon"><ShieldCheck size={22} /></span><div><h2>{halted ? '风控总闸已关闭' : '风控总闸运行中'}</h2><p>{halted ? 'Agent 可以继续分析，但所有新订单都会被拒绝' : '所有订单必须逐项通过规则后才能提交到交易所'}</p></div></div><div className="gate-stats"><div><span>今日检查</span><strong>{checks}</strong></div><div><span>拒绝事件</span><strong className={rejected ? 'text-negative' : ''}>{rejected}</strong></div><div><span>实时盈亏</span><strong className={Number(account?.unrealizedPnl || 0) >= 0 ? 'text-positive' : 'text-negative'}>{Number(account?.unrealizedPnl || 0).toFixed(2)}</strong></div></div></section><section className="rule-grid">{rules.map((rule) => <article className="rule-card" key={rule.name}><header><Gauge size={17} /><span className={rule.state === '需要处理' ? 'warning-label' : 'healthy-label'}>{rule.state}</span></header><h3>{rule.name}</h3><strong>{rule.value}</strong><p>{rule.detail}</p></article>)}</section><section className="panel exposure-panel"><header className="panel-header"><div><h2>{marketType === 'spot' ? '现货资产' : '当前持仓敞口'}</h2><p>按账户最新快照计算</p></div><span className="quiet-chip">{account?.source === 'binance' ? 'Binance 实时' : '模拟数据'}</span></header><HoldingsTable account={account} marketType={marketType} /></section></main>
 }
 
 function ExchangeModal({ initialEnvironment, onClose, onSaved }: { initialEnvironment: Environment; onClose: () => void; onSaved: (environment: Environment) => void }) {
@@ -610,6 +653,7 @@ export default function App() {
   const [halted, setHalted] = useState(false)
   const [agentList, setAgentList] = useState<AgentDefinition[]>([])
   const [agentLogs, setAgentLogs] = useState<AgentEvent[]>([])
+  const [editingAgent, setEditingAgent] = useState<AgentDefinition | null>(null)
   const [agentsLoading, setAgentsLoading] = useState(true)
   const [agentsError, setAgentsError] = useState<string | null>(null)
   const [busyAgentIds, setBusyAgentIds] = useState<Set<string>>(new Set())
@@ -629,8 +673,15 @@ export default function App() {
   const [proxyUrl, setProxyUrl] = useState('')
   const [connectionRevision, setConnectionRevision] = useState(0)
   const [pendingLiveOrder, setPendingLiveOrder] = useState<TradingOrder | null>(null)
+  const [orders, setOrders] = useState<TradingOrder[]>([])
+  const [ordersLoading, setOrdersLoading] = useState(false)
+  const [refreshingAll, setRefreshingAll] = useState(false)
+  const [lastRefreshedAt, setLastRefreshedAt] = useState<number | null>(null)
+  const [marketRefreshKey, setMarketRefreshKey] = useState(0)
+  const accountRequestId = useRef(0)
+  const ordersRequestId = useRef(0)
   const symbol = symbolsByMarket[marketType]
-  const { tick, book } = useMarketData(marketType, symbol, interval)
+  const { tick, book } = useMarketData(environment, marketType, symbol, interval, marketRefreshKey)
   const binanceConfigured = environment === 'paper' ? true : binanceEnvironments[environment]
   const latestTick = useRef(tick)
   useEffect(() => { latestTick.current = tick }, [tick])
@@ -644,7 +695,7 @@ export default function App() {
     if (!window.atlas?.agents) {
       setAgentsLoading(false)
       setAgentsError('Agent 运行时桥接尚未载入，请重新启动 Atlas 桌面开发版')
-      return
+      return false
     }
     setAgentsLoading(true)
     try {
@@ -655,8 +706,10 @@ export default function App() {
       setAgentList(definitions)
       setAgentLogs(events)
       setAgentsError(null)
+      return true
     } catch (caught) {
       setAgentsError(caught instanceof Error ? caught.message : 'Agent 运行时同步失败')
+      return false
     } finally {
       setAgentsLoading(false)
     }
@@ -676,7 +729,11 @@ export default function App() {
   }, [refreshAgents])
 
   const changeSymbol = useCallback((value: string) => {
+    accountRequestId.current += 1
+    ordersRequestId.current += 1
     setAccount(null)
+    setOrders([])
+    setPendingLiveOrder(null)
     setSymbolsByMarket((current) => current[marketType] === value ? current : { ...current, [marketType]: value })
   }, [marketType])
 
@@ -710,20 +767,67 @@ export default function App() {
   }, [connectionRevision])
 
   const refreshAccount = useCallback(async () => {
+    const requestId = ++accountRequestId.current
+    if (!window.atlas?.binance || (environment !== 'paper' && !binanceConfigured)) {
+      if (requestId === accountRequestId.current) setAccount(null)
+      return false
+    }
     try {
       const currentTick = latestTick.current
-      const snapshot = await window.atlas?.binance.account({
+      const snapshot = await window.atlas.binance.account({
         environment,
         marketType,
         symbol,
         markPrice: currentTick.symbol === symbol && currentTick.connected ? currentTick.price : undefined,
       })
-      if (snapshot) setAccount(snapshot)
+      if (requestId !== accountRequestId.current) return false
+      if (snapshot && snapshot.environment === environment && snapshot.marketType === marketType) {
+        setAccount(snapshot)
+        return true
+      }
+      return false
     } catch (caught) {
-      setAccount(null)
-      showToast(caught instanceof Error ? caught.message : '账户同步失败')
+      if (requestId === accountRequestId.current) {
+        setAccount(null)
+        showToast(caught instanceof Error ? caught.message : '账户同步失败')
+      }
+      return false
     }
-  }, [environment, marketType, showToast, symbol])
+  }, [binanceConfigured, environment, marketType, showToast, symbol])
+
+  const refreshOrders = useCallback(async (notify = false) => {
+    const requestId = ++ordersRequestId.current
+    if (!window.atlas?.binance || (environment !== 'paper' && !binanceConfigured)) {
+      setOrders([])
+      setOrdersLoading(false)
+      if (notify) showToast(window.atlas?.binance ? `请先配置 Binance ${environmentLabel(environment)}凭证` : '订单同步需要在 Atlas 桌面应用中运行')
+      return false
+    }
+    setOrdersLoading(true)
+    try {
+      const data = await window.atlas.binance.orders({ environment, marketType, symbol })
+      if (requestId !== ordersRequestId.current) return false
+      setOrders(data)
+      if (notify) showToast(`订单已同步 · ${data.length} 条`)
+      return true
+    } catch (caught) {
+      if (requestId === ordersRequestId.current && notify) showToast(caught instanceof Error ? caught.message : '订单同步失败')
+      return false
+    } finally {
+      if (requestId === ordersRequestId.current) setOrdersLoading(false)
+    }
+  }, [binanceConfigured, environment, marketType, showToast, symbol])
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => { void refreshOrders() }, 0)
+    return () => window.clearTimeout(timer)
+  }, [refreshOrders])
+
+  useEffect(() => {
+    if (active !== 'orders') return
+    const timer = window.setInterval(() => { void refreshOrders() }, 3000)
+    return () => window.clearInterval(timer)
+  }, [active, refreshOrders])
 
   useEffect(() => {
     if (environment === 'paper' || !binanceConfigured || !window.atlas) return
@@ -743,20 +847,18 @@ export default function App() {
   }, [binanceConfigured, environment, marketType, refreshAccount, showToast])
 
   useEffect(() => {
-    let cancelled = false
+    if (!binanceConfigured) return
+    let active = true
+    let inFlight = false
     const refresh = async () => {
-      try {
-        const currentTick = latestTick.current
-        const snapshot = await window.atlas?.binance.account({ environment, marketType, symbol, markPrice: currentTick.symbol === symbol && currentTick.connected ? currentTick.price : undefined })
-        if (!cancelled && snapshot) setAccount(snapshot)
-      } catch (caught) {
-        if (!cancelled) { setAccount(null); showToast(caught instanceof Error ? caught.message : '账户同步失败') }
-      }
+      if (!active || inFlight) return
+      inFlight = true
+      try { await refreshAccount() } finally { inFlight = false }
     }
-    refresh()
+    void refresh()
     const timer = window.setInterval(refresh, environment === 'paper' ? 1000 : 5000)
-    return () => { cancelled = true; window.clearInterval(timer) }
-  }, [environment, marketType, showToast, symbol])
+    return () => { active = false; window.clearInterval(timer) }
+  }, [binanceConfigured, environment, refreshAccount])
 
   const toggleAgent = useCallback(async (agent: AgentDefinition) => {
     if (!window.atlas?.agents || busyAgentIds.has(agent.id)) {
@@ -796,9 +898,36 @@ export default function App() {
     const created = await window.atlas.agents.create(definition)
     await refreshAgents()
     setModal(null)
+    setEditingAgent(null)
     setActive('agents')
     showToast(`${created.name} 已创建，当前保持暂停`)
   }, [refreshAgents, showToast])
+
+  const updateAgent = useCallback(async (definition: AgentCreateInput) => {
+    if (!window.atlas?.agents) throw new Error('Agent 运行时桥接尚未载入，请重新启动 Atlas 桌面开发版')
+    if (!editingAgent) throw new Error('没有可编辑的 Agent')
+    const updated = await window.atlas.agents.update(editingAgent.id, definition, editingAgent.revision)
+    await refreshAgents()
+    setModal(null)
+    setEditingAgent(null)
+    setActive('agents')
+    showToast(`${updated.name} 已保存并暂停，请确认配置后重新启动`)
+  }, [editingAgent, refreshAgents, showToast])
+
+  const openNewAgent = useCallback(() => {
+    setEditingAgent(null)
+    setModal('agent')
+  }, [])
+
+  const openEditAgent = useCallback((agent: AgentDefinition) => {
+    setEditingAgent(agent)
+    setModal('agent')
+  }, [])
+
+  const closeAgentModal = useCallback(() => {
+    setModal(null)
+    setEditingAgent(null)
+  }, [])
 
   const confirmAgentIntent = useCallback(async (intent: AgentIntent) => {
     if (!window.atlas?.agents || busyIntentIds.has(intent.id)) {
@@ -827,61 +956,111 @@ export default function App() {
         return true
       }
       const result = await window.atlas.binance.placeOrder(order)
-      await refreshAccount()
+      await Promise.all([refreshAccount(), refreshOrders()])
       showToast(`${environmentLabel(order.environment)}订单已提交 · ${result.status || 'NEW'} · ${order.symbol}`)
       return true
     } catch (caught) {
       showToast(caught instanceof Error ? caught.message : '订单提交失败')
       return false
     }
-  }, [refreshAccount, showToast])
+  }, [refreshAccount, refreshOrders, showToast])
 
   const confirmLiveOrder = async () => {
     if (!pendingLiveOrder) return
     try {
       const result = await window.atlas?.binance.placeOrder({ ...pendingLiveOrder, confirmation: 'LIVE_ORDER_CONFIRMED' })
-      await refreshAccount()
+      await Promise.all([refreshAccount(), refreshOrders()])
       setPendingLiveOrder(null)
       showToast(`生产订单已提交 · ${result?.status || 'NEW'} · ${pendingLiveOrder.symbol}`)
     } catch (caught) { showToast(caught instanceof Error ? caught.message : '生产订单提交失败') }
   }
 
   const changeEnvironment = (value: Environment) => {
+    if (value === environment) return
+    accountRequestId.current += 1
+    ordersRequestId.current += 1
     setAccount(null)
+    setOrders([])
+    setPendingLiveOrder(null)
     setEnvironment(value)
     showToast(value === 'live' ? '已切换到生产环境，真实订单需要逐笔确认' : `已切换到${environmentLabel(value)}`)
+  }
+
+  const changeMarketType = (value: MarketType) => {
+    if (value === marketType) return
+    accountRequestId.current += 1
+    ordersRequestId.current += 1
+    setAccount(null)
+    setOrders([])
+    setPendingLiveOrder(null)
+    setMarketType(value)
+    showToast(`已切换到${value === 'spot' ? '现货' : 'USDT 永续'}`)
   }
 
   const navigate = (id: string) => {
     if (navigation.some((item) => item.id === id)) setActive(id as NavId)
   }
 
+  const refreshAll = useCallback(async () => {
+    if (refreshingAll) return
+    setRefreshingAll(true)
+    setMarketRefreshKey((key) => key + 1)
+    try {
+      const results = await Promise.all([refreshAccount(), refreshOrders(), refreshAgents()])
+      const succeeded = results.filter(Boolean).length
+      const refreshedAt = Date.now()
+      setLastRefreshedAt(refreshedAt)
+      showToast(succeeded === results.length
+        ? `实时数据已刷新 · ${new Date(refreshedAt).toLocaleTimeString('zh-CN', { hour12: false })}`
+        : `已刷新 ${succeeded}/${results.length} 个数据模块，请检查连接状态`)
+    } finally {
+      setRefreshingAll(false)
+    }
+  }, [refreshAccount, refreshAgents, refreshingAll, refreshOrders, showToast])
+
+  const notifications = useMemo<AppNotification[]>(() => {
+    const items: AppNotification[] = []
+    if (halted) items.push({ id: 'execution-halted', title: '交易执行已停止', detail: '风控总闸正在拒绝所有新订单', navigateTo: 'risk', tone: 'warning' })
+    if (environment !== 'paper' && !binanceConfigured) items.push({ id: 'binance-unconfigured', title: `Binance ${environmentLabel(environment)}尚未配置`, detail: '账户、订单和 Agent 执行保持禁用', navigateTo: 'connections', tone: 'warning' })
+    if (!modelConfigured) items.push({ id: 'model-unconfigured', title: '模型路由尚未验证', detail: 'AI 助手和 AI 监督 Agent 暂不可用', navigateTo: 'connections', tone: 'warning' })
+    ;[...agentLogs]
+      .filter((event) => event.level !== 'info')
+      .sort((left, right) => right.timestamp - left.timestamp)
+      .slice(0, 3)
+      .forEach((event) => items.push({ id: `agent-${event.id}`, title: event.type.startsWith('AI_') ? 'AI 监督需要检查' : 'Agent 运行事件', detail: event.message, timestamp: event.timestamp, navigateTo: 'agents', tone: 'warning' }))
+    if (!items.length) items.push({ id: 'healthy', title: '当前没有待处理事项', detail: '交易所、模型和 Agent 未报告告警', navigateTo: 'overview', tone: 'healthy' })
+    return items
+  }, [agentLogs, binanceConfigured, environment, halted, modelConfigured])
+  const notificationCount = notifications.filter((item) => item.tone === 'warning').length
+
   return (
+    <MarketEnvironmentContext.Provider value={environment}>
     <div className="app-shell">
       <Sidebar active={active} onNavigate={setActive} open={sidebarOpen} onClose={() => setSidebarOpen(false)} environment={environment} binanceConfigured={binanceConfigured} modelConfigured={modelConfigured} agentCount={agentList.length} />
       {sidebarOpen && <button className="sidebar-scrim" onClick={() => setSidebarOpen(false)} aria-label="关闭导航" />}
       <div className="app-main">
-        <Topbar environment={environment} marketType={marketType} onEnvironment={changeEnvironment} onMarketType={(value) => { setAccount(null); setMarketType(value); showToast(`已切换到${value === 'spot' ? '现货' : 'USDT 永续'}`) }} onMenu={() => setSidebarOpen(true)} onModal={setModal} onSearch={() => setCommandOpen(true)} onAccount={() => showToast('本地工作区用户 · 凭证由系统钥匙串保护')} />
-        {active === 'overview' && <Overview key={`${marketType}:${symbol}`} environment={environment} marketType={marketType} symbol={symbol} interval={interval} account={account} tick={tick} book={book} halted={halted} agents={agentList} agentLogs={agentLogs} agentsLoading={agentsLoading} busyAgentIds={busyAgentIds} onSymbol={changeSymbol} onInterval={setInterval} onModal={setModal} onToggleAgent={toggleAgent} onManageAgents={() => setActive('agents')} onPlaceOrder={placeOrder} onRefreshAccount={refreshAccount} onToast={showToast} />}
+        <Topbar environment={environment} marketType={marketType} refreshing={refreshingAll} lastRefreshedAt={lastRefreshedAt} notificationCount={notificationCount} onEnvironment={changeEnvironment} onMarketType={changeMarketType} onMenu={() => setSidebarOpen(true)} onModal={setModal} onSearch={() => setCommandOpen(true)} onRefresh={() => void refreshAll()} onAccount={() => showToast('本地工作区用户 · 凭证由系统钥匙串保护')} />
+        {active === 'overview' && <Overview key={`${environment}:${marketType}:${symbol}`} environment={environment} marketType={marketType} symbol={symbol} interval={interval} marketRefreshKey={marketRefreshKey} account={account} tick={tick} book={book} halted={halted} agents={agentList} agentLogs={agentLogs} agentsLoading={agentsLoading} busyAgentIds={busyAgentIds} onSymbol={changeSymbol} onInterval={setInterval} onModal={(id) => { if (id === 'agent') openNewAgent(); else setModal(id) }} onToggleAgent={toggleAgent} onManageAgents={() => setActive('agents')} onPlaceOrder={placeOrder} onRefreshAccount={refreshAccount} onToast={showToast} />}
         {active === 'assistant' && <AssistantView environment={environment} marketType={marketType} symbol={symbol} tick={tick} account={account} halted={halted} enabledSkills={[...enabledSkills]} mcpConnection={mcpConnection} onOpenConnections={() => setModal('model')} />}
-        {active === 'agents' && <AgentsView agents={agentList} logs={agentLogs} account={account} currentEnvironment={environment} loading={agentsLoading} error={agentsError} busyAgentIds={busyAgentIds} evaluatingAgentIds={evaluatingAgentIds} busyIntentIds={busyIntentIds} onToggle={toggleAgent} onEvaluate={evaluateAgent} onConfirmIntent={confirmAgentIntent} onRefresh={refreshAgents} onNew={() => setModal('agent')} />}
-        {active === 'strategies' && <StrategiesView onToast={showToast} />}
+        {active === 'agents' && <AgentsView agents={agentList} logs={agentLogs} account={account} currentEnvironment={environment} loading={agentsLoading} error={agentsError} busyAgentIds={busyAgentIds} evaluatingAgentIds={evaluatingAgentIds} busyIntentIds={busyIntentIds} onToggle={toggleAgent} onEvaluate={evaluateAgent} onConfirmIntent={confirmAgentIntent} onRefresh={async () => { await refreshAgents() }} onNew={openNewAgent} onEdit={openEditAgent} />}
+        {active === 'strategies' && <StrategiesView environment={environment} marketType={marketType} symbol={symbol} interval={interval} onToast={showToast} />}
         {active === 'skills' && <SkillsView enabled={enabledSkills} onToggle={toggleSkill} onToast={showToast} mcpConnection={mcpConnection} onMcpConnection={setMcpConnection} />}
         {active === 'connections' && <ConnectionsView environment={environment} binanceConfigured={binanceConfigured} modelConfigured={modelConfigured} modelConfig={modelConfig} proxyUrl={proxyUrl} onExchange={() => setModal('exchange')} onModel={() => setModal('model')} onNetwork={() => setModal('network')} onToast={showToast} />}
-        {active === 'risk' && <RiskView halted={halted} account={account} marketType={marketType} onEmergency={() => setModal('emergency')} onToast={showToast} />}
-        {active === 'orders' && <OrdersView key={`${environment}:${marketType}:${symbol}`} environment={environment} marketType={marketType} symbol={symbol} account={account} onToast={showToast} />}
-        {active === 'review' && <ReviewView onToast={showToast} />}
+        {active === 'risk' && <RiskView halted={halted} account={account} marketType={marketType} agents={agentList} logs={agentLogs} onEmergency={() => setModal('emergency')} />}
+        {active === 'orders' && <OrdersView environment={environment} marketType={marketType} symbol={symbol} tick={tick} account={account} orders={orders} loading={ordersLoading} onRefresh={() => refreshOrders(true)} onToast={showToast} />}
+        {active === 'review' && <ReviewView orders={orders} agentLogs={agentLogs} onToast={showToast} />}
       </div>
 
       {commandOpen && <CommandPalette onClose={() => setCommandOpen(false)} onNavigate={navigate} />}
-      {modal === 'exchange' && <ExchangeModal initialEnvironment={environment} onClose={() => setModal(null)} onSaved={(value) => { setModal(null); setEnvironment(value); setConnectionRevision((revision) => revision + 1); showToast(value === 'paper' ? '模拟盘已启用' : `Binance ${environmentLabel(value)}连接测试通过`) }} />}
+      {modal === 'exchange' && <ExchangeModal initialEnvironment={environment} onClose={() => setModal(null)} onSaved={(value) => { setModal(null); changeEnvironment(value); setConnectionRevision((revision) => revision + 1); showToast(value === 'paper' ? '模拟盘已启用' : `Binance ${environmentLabel(value)}连接测试通过`) }} />}
       {modal === 'model' && <ModelModal onClose={() => setModal(null)} onSaved={() => { setModal(null); setConnectionRevision((revision) => revision + 1); showToast('模型路由已保存，可在 AI 助手中发起真实请求') }} />}
       {modal === 'network' && <NetworkModal initialProxyUrl={proxyUrl} onClose={() => setModal(null)} onSaved={(value, latency) => { setProxyUrl(value); setModal(null); setConnectionRevision((revision) => revision + 1); showToast(`网络出口测试通过 · ${latency} ms · 行情正在重连`) }} />}
-      {modal === 'agent' && <AgentCreateModal initialEnvironment={environment} initialMarketType={marketType} initialSymbol={symbol} onClose={() => setModal(null)} onCreate={createAgent} />}
+      {modal === 'agent' && <AgentCreateModal agent={editingAgent} initialEnvironment={environment} initialMarketType={marketType} initialSymbol={symbol} enabledSkills={[...enabledSkills]} mcpConnection={mcpConnection} modelConfigured={modelConfigured} modelName={modelConfig.model} onClose={closeAgentModal} onSubmit={editingAgent ? updateAgent : createAgent} />}
       {modal === 'emergency' && <Modal title={halted ? '恢复交易执行' : '紧急停止所有执行'} subtitle={halted ? '恢复后 Agent 仍需逐笔通过风控规则' : '立即拒绝所有新订单，不影响行情监控'} onClose={() => setModal(null)}><div className="emergency-dialog"><AlertOctagon size={28} /><p>{halted ? '确认风控规则和交易所连接均正常后再恢复。已暂停的 Agent 不会自动启动。' : '运行中的 Agent 将切换为只分析模式。已提交的未成交订单需要在交易所侧单独处理。'}</p><div className="modal-actions"><button className="secondary-button" onClick={() => setModal(null)}>取消</button><button className={halted ? 'primary-button' : 'danger-button'} onClick={async () => { const next = !halted; try { await window.atlas?.risk?.setHalted(next); setHalted(next); setModal(null); showToast(next ? '已触发紧急停止，主进程将拒绝所有新订单' : '交易执行已恢复') } catch (caught) { showToast(caught instanceof Error ? caught.message : '风控总闸更新失败') } }}>{halted ? '确认恢复' : '确认停止'}</button></div></div></Modal>}
-      {modal === 'notifications' && <Modal title="通知" subtitle="需要处理的系统与 Agent 事件" onClose={() => setModal(null)}><div className="notification-list"><button onClick={() => { setModal(null); setActive('risk') }}><span className="notification-icon warning"><AlertOctagon size={16} /></span><div><strong>事件雷达已自动暂停</strong><p>日内回撤达到 2.0% 阈值</p><small>43 分钟前</small></div></button><button onClick={() => { setModal(null); setActive('connections') }}><span className="notification-icon"><ShieldCheck size={16} /></span><div><strong>连接状态检查</strong><p>查看交易所与模型路由配置</p><small>现在</small></div></button></div></Modal>}
+      {modal === 'notifications' && <Modal title="通知" subtitle={`${notificationCount} 条待处理 · 来自当前连接与 Agent 日志`} onClose={() => setModal(null)}><div className="notification-list">{notifications.map((item) => <button key={item.id} onClick={() => { setModal(null); setActive(item.navigateTo) }}><span className={`notification-icon ${item.tone === 'warning' ? 'warning' : ''}`}>{item.tone === 'warning' ? <AlertOctagon size={16} /> : <ShieldCheck size={16} />}</span><div><strong>{item.title}</strong><p>{item.detail}</p><small>{relativeTime(item.timestamp)}</small></div></button>)}</div></Modal>}
       {pendingLiveOrder && <LiveOrderModal order={pendingLiveOrder} onClose={() => setPendingLiveOrder(null)} onConfirm={confirmLiveOrder} />}
       {toast && <div className="toast"><ShieldCheck size={17} /><span>{toast}</span><button onClick={() => setToast(null)} aria-label="关闭"><X size={15} /></button></div>}
     </div>
+    </MarketEnvironmentContext.Provider>
   )
 }

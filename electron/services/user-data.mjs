@@ -61,6 +61,7 @@ class UserDataSocket {
         try {
           const data = JSON.parse(raw.toString())
           this.onEvent({ type: 'account', eventType: data.e || 'ACCOUNT_UPDATE', ...this.options, timestamp: data.E || Date.now() })
+          if (data.e === 'listenKeyExpired') queueMicrotask(() => this.reconnect())
         } catch (error) {
           console.error('[account-stream:parse]', error)
         }

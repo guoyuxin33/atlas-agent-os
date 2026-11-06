@@ -11,7 +11,13 @@ function parseResponse(contentType, text) {
   return JSON.parse(text)
 }
 
-async function rpc(url, method, params = {}, headers = {}) {
+function boundedTimeout(value, fallback = 15_000) {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return fallback
+  return Math.min(60_000, Math.max(500, Math.round(parsed)))
+}
+
+async function rpc(url, method, params = {}, headers = {}, timeoutMs) {
   const endpoint = new URL(url)
   if (!['http:', 'https:'].includes(endpoint.protocol)) throw new Error('MCP 地址必须使用 HTTP 或 HTTPS')
   const session = sessions.get(url)
@@ -24,6 +30,7 @@ async function rpc(url, method, params = {}, headers = {}) {
       ...headers,
     },
     body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params }),
+    signal: AbortSignal.timeout(boundedTimeout(timeoutMs)),
   })
   const text = await response.text()
   if (!response.ok) throw new Error(`MCP 请求失败 (${response.status})`)
@@ -39,11 +46,11 @@ export async function connectMcp(options) {
     protocolVersion: '2025-06-18',
     capabilities: {},
     clientInfo: { name: 'Atlas Agent OS', version: '0.2.0' },
-  }, options.headers)
-  const tools = await rpc(options.url, 'tools/list', {}, options.headers)
+  }, options.headers, options.timeoutMs)
+  const tools = await rpc(options.url, 'tools/list', {}, options.headers, options.timeoutMs)
   return { ok: true, serverInfo, tools: tools.tools || [], sessionId: sessions.get(options.url) || null }
 }
 
 export async function callMcpTool(options) {
-  return rpc(options.url, 'tools/call', { name: options.name, arguments: options.arguments || {} }, options.headers)
+  return rpc(options.url, 'tools/call', { name: options.name, arguments: options.arguments || {} }, options.headers, options.timeoutMs)
 }

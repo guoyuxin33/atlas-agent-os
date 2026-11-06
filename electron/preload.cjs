@@ -22,6 +22,9 @@ contextBridge.exposeInMainWorld('atlas', {
     test: (options) => ipcRenderer.invoke('binance:test', options),
     account: (options) => ipcRenderer.invoke('binance:account', options),
     orders: (options) => ipcRenderer.invoke('binance:orders', options),
+    openOrders: (options) => ipcRenderer.invoke('binance:openOrders', options),
+    order: (options) => ipcRenderer.invoke('binance:order', options),
+    cancelOrder: (options) => ipcRenderer.invoke('binance:cancelOrder', options),
     futuresConfig: (options) => ipcRenderer.invoke('binance:futuresConfig', options),
     futuresPositionMode: (options) => ipcRenderer.invoke('binance:futuresPositionMode', options),
     setFuturesLeverage: (options) => ipcRenderer.invoke('binance:setFuturesLeverage', options),
@@ -44,6 +47,7 @@ contextBridge.exposeInMainWorld('atlas', {
   },
   agents: {
     create: (definition) => ipcRenderer.invoke('agents:create', definition),
+    update: (agentId, definition, expectedRevision) => ipcRenderer.invoke('agents:update', agentId, definition, expectedRevision),
     start: (agentId) => ipcRenderer.invoke('agents:start', agentId),
     pause: (agentId) => ipcRenderer.invoke('agents:pause', agentId),
     evaluateNow: (agentId) => ipcRenderer.invoke('agents:evaluate-now', agentId),

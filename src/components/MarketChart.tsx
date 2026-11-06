@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { CandlestickSeries, ColorType, createChart, HistogramSeries, LineSeries, type CandlestickData, type HistogramData, type LineData, type Time } from 'lightweight-charts'
+import { useMarketEnvironment } from '../contexts/MarketEnvironmentContext'
 import type { Candle, MarketInterval, MarketType } from '../types'
 
 interface MarketChartProps {
@@ -7,6 +8,7 @@ interface MarketChartProps {
   symbol: string
   interval: MarketInterval
   showMA: boolean
+  refreshKey?: number
 }
 
 function movingAverage(rows: Candle[], length = 20): LineData<Time>[] {
@@ -16,7 +18,8 @@ function movingAverage(rows: Candle[], length = 20): LineData<Time>[] {
   }))
 }
 
-export function MarketChart({ marketType, symbol, interval, showMA }: MarketChartProps) {
+export function MarketChart({ marketType, symbol, interval, showMA, refreshKey = 0 }: MarketChartProps) {
+  const environment = useMarketEnvironment()
   const containerRef = useRef<HTMLDivElement>(null)
   const [source, setSource] = useState<'live' | 'cached'>('cached')
 
@@ -73,8 +76,8 @@ export function MarketChart({ marketType, symbol, interval, showMA }: MarketChar
 
     const controller = new AbortController()
     const loadHistory = window.atlas
-      ? window.atlas.market.history({ marketType, symbol, interval, limit: 2000 })
-      : fetch(`${marketType === 'futures' ? 'https://fapi.binance.com/fapi/v1/klines' : 'https://api.binance.com/api/v3/klines'}?symbol=${symbol}&interval=${interval}&limit=1000`, { signal: controller.signal })
+      ? window.atlas.market.history({ environment, marketType, symbol, interval, limit: 2000 })
+      : fetch(`${environment === 'testnet' ? marketType === 'futures' ? 'https://testnet.binancefuture.com/fapi/v1/klines' : 'https://testnet.binance.vision/api/v3/klines' : marketType === 'futures' ? 'https://fapi.binance.com/fapi/v1/klines' : 'https://api.binance.com/api/v3/klines'}?symbol=${symbol}&interval=${interval}&limit=1000`, { signal: controller.signal })
         .then((response) => response.json())
         .then((rows: Array<Array<number | string>>) => rows.map((row): Candle => ({ time: Math.floor(Number(row[0]) / 1000), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), volume: Number(row[5]) })))
 
@@ -102,7 +105,8 @@ export function MarketChart({ marketType, symbol, interval, showMA }: MarketChar
       })
 
     const off = window.atlas?.market.onUpdate((update) => {
-      if (update.type !== 'kline' || update.marketType !== marketType || update.symbol !== symbol || update.interval !== interval) return
+      const publicEnvironment = environment === 'testnet' ? 'testnet' : 'live'
+      if (update.type !== 'kline' || update.environment !== publicEnvironment || update.marketType !== marketType || update.symbol !== symbol || update.interval !== interval) return
       const candle = update.candle
       series.update({ time: candle.time as Time, open: candle.open, high: candle.high, low: candle.low, close: candle.close })
       volumeSeries.update({ time: candle.time as Time, value: candle.volume, color: candle.close >= candle.open ? 'rgba(79, 189, 136, 0.22)' : 'rgba(223, 104, 104, 0.2)' })
@@ -125,7 +129,7 @@ export function MarketChart({ marketType, symbol, interval, showMA }: MarketChar
       resizeObserver.disconnect()
       chart.remove()
     }
-  }, [interval, marketType, showMA, symbol])
+  }, [environment, interval, marketType, refreshKey, showMA, symbol])
 
   return (
     <div className="chart-shell">

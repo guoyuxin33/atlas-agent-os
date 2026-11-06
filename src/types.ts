@@ -31,10 +31,10 @@ export interface MarketBook {
 }
 
 export type MarketUpdate =
-  | { type: 'connection'; marketType: MarketType; connected: boolean; timestamp: number }
-  | ({ type: 'ticker'; marketType: MarketType; timestamp: number } & Omit<MarketTick, 'connected'>)
-  | { type: 'kline'; marketType: MarketType; symbol: string; interval: MarketInterval; candle: Candle; closed: boolean; timestamp: number }
-  | ({ type: 'book'; marketType: MarketType; symbol: string; timestamp: number } & MarketBook)
+  | { type: 'connection'; environment: Exclude<Environment, 'paper'>; marketType: MarketType; connected: boolean; timestamp: number }
+  | ({ type: 'ticker'; environment: Exclude<Environment, 'paper'>; marketType: MarketType; timestamp: number } & Omit<MarketTick, 'connected'>)
+  | { type: 'kline'; environment: Exclude<Environment, 'paper'>; marketType: MarketType; symbol: string; interval: MarketInterval; candle: Candle; closed: boolean; timestamp: number }
+  | ({ type: 'book'; environment: Exclude<Environment, 'paper'>; marketType: MarketType; symbol: string; timestamp: number } & MarketBook)
 
 export interface AccountSnapshot {
   source: 'paper' | 'binance'
@@ -119,11 +119,22 @@ export interface TradingOrder {
   confirmation?: string
   clientOrderId?: string
   transactTime?: number
+  updateTime?: number
+  executedQty?: string
+  remainingOpenQty?: string
+  avgPrice?: string
+  cummulativeQuoteQty?: string
+  realizedPnl?: string
+  unrealizedPnl?: string
+  netPnl?: string
+  commission?: string
+  commissionAsset?: string
 }
 
 export type AgentStrategy = 'ma-crossover' | 'donchian' | 'rsi' | 'bollinger' | 'atr-breakout'
 export type AgentStatus = 'paused' | 'running'
 export type AgentIntentStatus = 'pending' | 'executed' | 'rejected' | 'expired'
+export type AgentPositionMode = 'long-only' | 'short-only' | 'auto'
 
 export interface AgentRiskSettings {
   riskFraction: number
@@ -131,9 +142,22 @@ export interface AgentRiskSettings {
   maxQuantity?: number
 }
 
+export type AgentIntelligenceMode = 'strategy' | 'ai-supervised'
+
+export interface AgentIntelligenceSettings {
+  mode: AgentIntelligenceMode
+  model?: string
+  skills: string[]
+  mcpServers: string[]
+  mcpTools: string[]
+  confidenceThreshold: number
+  failClosed: boolean
+}
+
 export interface AgentIntent {
   id: string
   agentId: string
+  agentRevision: number
   environment: 'live'
   status: AgentIntentStatus
   order: TradingOrder
@@ -148,15 +172,18 @@ export interface AgentIntent {
 
 export interface AgentDefinition {
   id: string
+  revision: number
   name: string
   strategy: AgentStrategy
   environment: Environment
   marketType: MarketType
+  positionMode: AgentPositionMode
   symbol: string
   interval: MarketInterval
   status: AgentStatus
   params: Record<string, string | number | boolean>
   risk: AgentRiskSettings
+  intelligence: AgentIntelligenceSettings
   runtime: {
     lastEvaluatedCandle?: number
     lastEvaluatedAt?: number
@@ -173,7 +200,7 @@ export interface AgentDefinition {
   updatedAt: number
 }
 
-export type AgentCreateInput = Omit<AgentDefinition, 'id' | 'status' | 'params' | 'risk' | 'runtime' | 'pendingIntents' | 'createdAt' | 'updatedAt'> & {
+export type AgentCreateInput = Omit<AgentDefinition, 'id' | 'revision' | 'status' | 'params' | 'risk' | 'runtime' | 'pendingIntents' | 'createdAt' | 'updatedAt'> & {
   risk?: Partial<AgentRiskSettings>
   params?: Record<string, string | number | boolean>
 }
