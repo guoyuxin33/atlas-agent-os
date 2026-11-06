@@ -10,7 +10,7 @@ interface Window {
     saveSecrets: (namespace: string, values: Record<string, string>) => Promise<{ ok: boolean }>
     vaultStatus: (namespace: string) => Promise<{ configured: boolean; config?: Record<string, string> }>
     market: {
-      history: (options: { environment: import('./types').Environment; marketType: 'spot' | 'futures'; symbol: string; interval: string; limit?: number }) => Promise<import('./types').Candle[]>
+      history: (options: { environment: import('./types').Environment; marketType: 'spot' | 'futures'; symbol: string; interval: string; limit?: number; startTime?: number; endTime?: number }) => Promise<import('./types').Candle[]>
       markets: (options: { environment: import('./types').Environment; marketType: 'spot' | 'futures' }) => Promise<Array<{ symbol: string; baseAsset: string; quoteAsset: string; status: string }>>
       subscribe: (options: { environment: import('./types').Environment; marketType: 'spot' | 'futures'; symbol: string; interval: string }) => Promise<{ ok: boolean; topic: string }>
       unsubscribe: (options: { environment: import('./types').Environment; marketType: 'spot' | 'futures'; symbol: string; interval: string }) => Promise<{ ok: boolean }>

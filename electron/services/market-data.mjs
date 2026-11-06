@@ -25,7 +25,9 @@ const WS_BASE = {
 }
 
 const HISTORY_CACHE_LIMIT = 24
-const HISTORY_SERIES_LIMIT = 5000
+const HISTORY_SERIES_LIMIT = 20_000
+const HISTORY_REQUEST_LIMIT = HISTORY_SERIES_LIMIT
+const BINANCE_KLINE_PAGE_LIMIT = 1000
 const IPC_BATCH_INTERVAL = 16
 const MARKET_CACHE_TTL = 5 * 60 * 1000
 const LATEST_UPDATE_LIMIT = 2048
@@ -61,6 +63,40 @@ function historyKey(environment, marketType, symbol, interval) {
 
 function intervalSeconds(interval) {
   return { '1m': 60, '5m': 300, '15m': 900, '1h': 3600, '4h': 14_400, '1d': 86_400 }[interval] || 900
+}
+
+function finiteTimestamp(value, label) {
+  if (value === undefined || value === null || value === '') return undefined
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed < 0) throw new Error(`${label} 必须是有效的 Unix 毫秒时间戳`)
+  return Math.trunc(parsed)
+}
+
+function historyRequestOptions(options = {}) {
+  const limit = Math.min(Math.max(Math.trunc(Number(options.limit) || 1000), 1), HISTORY_REQUEST_LIMIT)
+  const startTime = finiteTimestamp(options.startTime, 'startTime')
+  const endTime = finiteTimestamp(options.endTime, 'endTime')
+  if (startTime !== undefined && endTime !== undefined && startTime > endTime) throw new Error('startTime 不能晚于 endTime')
+  return { limit, startTime, endTime }
+}
+
+function parseKlineRows(rows) {
+  if (!Array.isArray(rows)) return []
+  return [...new Map(rows
+    .filter((row) => Array.isArray(row) && row.length >= 6 && row.slice(0, 6).every((value) => Number.isFinite(Number(value))))
+    .map((row) => [Number(row[0]), row])).values()]
+    .sort((left, right) => Number(left[0]) - Number(right[0]))
+}
+
+function rowToCandle(row) {
+  return {
+    time: Math.floor(Number(row[0]) / 1000),
+    open: Number(row[1]),
+    high: Number(row[2]),
+    low: Number(row[3]),
+    close: Number(row[4]),
+    volume: Number(row[5]),
+  }
 }
 
 function mergeCandles(current = [], additions = []) {
@@ -423,7 +459,9 @@ export class MarketDataHub {
     const marketType = options.marketType === 'futures' ? 'futures' : 'spot'
     const interval = ['1m', '5m', '15m', '1h', '4h', '1d'].includes(options.interval) ? options.interval : '15m'
     const symbol = String(options.symbol || 'BTCUSDT').toUpperCase()
-    const limit = Math.min(Math.max(Number(options.limit) || 1000, 100), 5000)
+    const { limit, startTime, endTime } = historyRequestOptions(options)
+    const ranged = startTime !== undefined || endTime !== undefined
+    if (ranged) return this.fetchHistoryRange({ environment, marketType, interval, symbol, limit, startTime, endTime })
     const cacheKey = historyKey(environment, marketType, symbol, interval)
     let cached = this.historyCache.get(cacheKey)
     const canUseCached = () => Boolean(
@@ -444,37 +482,44 @@ export class MarketDataHub {
     }
     const path = marketType === 'futures' ? '/fapi/v1/klines' : '/api/v3/klines'
     const request = (async () => {
-      let endTime
-      let remaining = limit
-      let rows = []
+      const reusable = cached?.data?.length && hasContinuousTail(cached.data, cached.data.length, interval)
+        ? cached.data.slice(-limit)
+        : []
+      let cursorEndTime = reusable.length ? Number(reusable[0].time) * 1000 - 1 : undefined
+      let remaining = Math.max(0, limit - reusable.length)
+      let candles = reusable
       let exhausted = false
       while (remaining > 0) {
-        const batchSize = Math.min(1000, remaining)
+        const batchSize = Math.min(BINANCE_KLINE_PAGE_LIMIT, remaining)
         const query = new URLSearchParams({ symbol, interval, limit: String(batchSize) })
-        if (endTime) query.set('endTime', String(endTime))
-        const response = await this.fetchPublicResponse(`${REST_BASE[environment][marketType]}${path}?${query.toString()}`)
-        const batch = await response.json()
-        if (!response.ok) throw new Error(batch?.msg || `History request failed (${response.status})`)
-        if (!Array.isArray(batch) || !batch.length) {
+        if (cursorEndTime !== undefined) query.set('endTime', String(cursorEndTime))
+        const batch = await this.fetchKlinePage(environment, marketType, path, query)
+        if (!batch.length) {
           exhausted = true
           break
         }
-        rows = [...batch, ...rows]
-        remaining -= batch.length
-        endTime = Number(batch[0][0]) - 1
+        candles = mergeCandles(batch.map(rowToCandle), candles)
+        remaining = Math.max(0, limit - candles.length)
+        const partial = this.historyCache.get(cacheKey)
+        if (partial) {
+          partial.data = mergeCandles(partial.data, candles)
+          partial.loadedLimit = Math.max(Number(partial.loadedLimit) || 0, Math.min(limit, candles.length))
+        }
+        const nextEndTime = Number(batch[0][0]) - 1
+        if (!(nextEndTime < (cursorEndTime ?? Number.POSITIVE_INFINITY))) {
+          exhausted = true
+          break
+        }
+        cursorEndTime = nextEndTime
         if (batch.length < batchSize) {
           exhausted = true
           break
         }
       }
-      const candles = [...new Map(rows.map((row) => [Number(row[0]), row])).values()]
-        .sort((left, right) => Number(left[0]) - Number(right[0]))
-        .slice(-limit)
-        .map((row) => ({ time: Math.floor(Number(row[0]) / 1000), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), volume: Number(row[5]) }))
       const latest = this.historyCache.get(cacheKey) || cached || { data: [], loadedLimit: 0, exhausted: false }
       this.historyCache.set(cacheKey, {
         data: mergeCandles(latest.data, candles),
-        loadedLimit: Math.max(Number(latest.loadedLimit) || 0, limit),
+        loadedLimit: Math.max(Number(latest.loadedLimit) || 0, Math.min(limit, candles.length)),
         exhausted: Boolean(latest.exhausted || exhausted),
       })
       while (this.historyCache.size > HISTORY_CACHE_LIMIT) this.historyCache.delete(this.historyCache.keys().next().value)
@@ -503,6 +548,59 @@ export class MarketDataHub {
       if (canUseCached()) return cached.data.slice(-limit)
       throw error
     }
+  }
+
+  async fetchKlinePage(environment, marketType, path, query) {
+    const response = await this.fetchPublicResponse(`${REST_BASE[environment][marketType]}${path}?${query.toString()}`)
+    const payload = await response.json()
+    if (!response.ok) {
+      const error = new Error(payload?.msg || `History request failed (${response.status})`)
+      if ([418, 429].includes(Number(response.status)) || Number(payload?.code) === -1003) {
+        error.code = -1003
+        const blockedUntil = this.rateLimitStates.get(this.rateLimitKey(environment, marketType)) || this.now()
+        error.retryAfter = Math.max(1, Math.ceil((blockedUntil - this.now()) / 1000))
+      }
+      throw error
+    }
+    return parseKlineRows(payload)
+  }
+
+  async fetchHistoryRange({ environment, marketType, interval, symbol, limit, startTime, endTime }) {
+    const path = marketType === 'futures' ? '/fapi/v1/klines' : '/api/v3/klines'
+    const forward = startTime !== undefined
+    let cursorStartTime = startTime
+    let cursorEndTime = endTime
+    let remaining = limit
+    let rows = []
+
+    while (remaining > 0) {
+      const batchSize = Math.min(BINANCE_KLINE_PAGE_LIMIT, remaining)
+      const query = new URLSearchParams({ symbol, interval, limit: String(batchSize) })
+      if (cursorStartTime !== undefined) query.set('startTime', String(cursorStartTime))
+      if (cursorEndTime !== undefined) query.set('endTime', String(cursorEndTime))
+      const batch = await this.fetchKlinePage(environment, marketType, path, query)
+      if (!batch.length) break
+      rows = parseKlineRows([...rows, ...batch])
+      remaining = Math.max(0, limit - rows.length)
+      if (batch.length < batchSize || !remaining) break
+
+      if (forward) {
+        const nextStartTime = Number(batch.at(-1)[0]) + 1
+        if (!(nextStartTime > cursorStartTime) || (endTime !== undefined && nextStartTime > endTime)) break
+        cursorStartTime = nextStartTime
+      } else {
+        const nextEndTime = Number(batch[0][0]) - 1
+        if (!(nextEndTime < cursorEndTime)) break
+        cursorEndTime = nextEndTime
+      }
+    }
+
+    return rows
+      .filter((row) => (startTime === undefined || Number(row[0]) >= startTime) && (endTime === undefined || Number(row[0]) <= endTime))
+      .sort((left, right) => Number(left[0]) - Number(right[0]))
+      .slice(forward ? 0 : -limit)
+      .slice(0, limit)
+      .map(rowToCandle)
   }
 
   async snapshot(options) {

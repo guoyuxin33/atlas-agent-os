@@ -46,12 +46,18 @@ Spot positions cannot open a naked short. Use USDT-M Futures when a strategy mus
 
 ### Strategy review and desktop safety
 
-- Local strategy parameter editing and Paper backtests over real public candle history, including Supertrend and MACD momentum baselines.
+- Seven local backtest strategies aligned with the Agent defaults: EMA/SMA crossover, Donchian, RSI, Bollinger, ATR breakout, Supertrend, and MACD momentum.
+- Up to 10,000 closed candles per strategy run with a configurable `20% / 30% / 40%` chronological exploratory holdout. The market-data service can cache and incrementally page up to 20,000 candles without re-fetching the newest pages.
+- Next-open execution without lookahead, Spot long-only enforcement, Futures shorting/leverage, fixed and trailing stops, take-profit, position sizing, current-notional funding estimates, fill-aware fees, and slippage.
+- Results separate in-sample and holdout dates, flag small trade samples, expose all cost assumptions, and report net/benchmark return, intrabar drawdown, win rate, profit factor, expectancy, payoff ratio, Sharpe ratio, average win/loss, and cost drag.
+- An auditable detail view shows the holdout equity curve and every trade with direction, entry/exit reference prices, return, MFE/MAE, and exit reason.
 - Order, position, Agent-log, review, and export views.
 - Credentials encrypted through Electron `safeStorage`; secrets are never returned to the renderer process.
 - `contextIsolation`, renderer sandboxing, Node.js integration disabled, and single-instance protection.
 - Shared HTTP/HTTPS proxy support for Binance, remote models, and MCP, with automatic bypass for local services.
 - No withdrawal API or withdrawal capability is implemented.
+
+![Atlas strategy holdout, equity curve, and trade audit](docs/assets/backtest.jpg)
 
 ## Run locally
 
@@ -95,7 +101,7 @@ npm run desktop:pack
 npm run desktop:dist
 ```
 
-`npm run verify` covers public market data, isolated Paper Futures behavior, and chat-session persistence. Paper verification uses an isolated temporary user directory and does not submit Testnet or Live orders.
+`npm run verify` covers public market data and pagination, all seven backtest strategies, next-open/risk/cost semantics, isolated Paper Futures behavior, and chat-session persistence. Paper verification uses an isolated temporary user directory and does not submit Testnet or Live orders.
 
 Desktop artifacts are written to `release/`. Local macOS builds are unsigned; public distribution requires platform signing and notarization.
 
@@ -105,6 +111,7 @@ Desktop artifacts are written to `release/`. Local macOS builds are unsigned; pu
 - Live orders require an explicit confirmation in the desktop application. Models cannot bypass this confirmation or deterministic risk checks.
 - Atlas is a single-machine trading workstation, not an exchange-colocated HFT system. It does not promise microsecond latency, multi-node coordination, or lossless execution during every network or exchange failure.
 - Market data, order acknowledgements, fills, and positions can temporarily diverge during reconnects or exchange incidents. Monitor execution logs and the Binance account independently.
+- Backtest funding uses a static user-supplied estimate and liquidation uses a dynamic zero-equity approximation; neither reproduces historical Binance funding or maintenance-margin tiers. Repeatedly tuning against the exploratory holdout contaminates it, so it is not proof of out-of-sample performance or future profitability.
 - Trading involves substantial risk. This project is engineering software, not investment advice or a profitability guarantee.
 
 See [the architecture notes](docs/architecture.md) for the process boundaries, data flow, and current scaling limits.
