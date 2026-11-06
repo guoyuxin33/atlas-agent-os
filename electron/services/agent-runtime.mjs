@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto'
 import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { ATR, BollingerBands, EMA, RSI, SMA } from 'technicalindicators'
+import { ATR, BollingerBands, EMA, MACD, RSI, SMA } from 'technicalindicators'
 
-const STRATEGIES = new Set(['ma-crossover', 'donchian', 'rsi', 'bollinger', 'atr-breakout'])
+const STRATEGIES = new Set(['ma-crossover', 'donchian', 'rsi', 'bollinger', 'atr-breakout', 'supertrend', 'macd-momentum'])
 const ENVIRONMENTS = new Set(['paper', 'testnet', 'live'])
 const INTERVALS = new Set(['1m', '5m', '15m', '1h', '4h', '1d'])
 const POSITION_MODES = new Set(['long-only', 'short-only', 'auto'])
@@ -30,6 +30,8 @@ const STRATEGY_DEFAULTS = {
   rsi: { period: 14, oversold: 30, overbought: 70, stopPercent: 0.01 },
   bollinger: { period: 20, stdDev: 2, stopPercent: 0.01 },
   'atr-breakout': { atrPeriod: 14, atrMultiple: 1.5 },
+  supertrend: { atrPeriod: 10, multiplier: 3 },
+  'macd-momentum': { fastPeriod: 12, slowPeriod: 26, signalPeriod: 9, stopPercent: 0.01 },
 }
 
 function finiteNumber(value, fallback = 0) {
@@ -107,6 +109,22 @@ function normalizeAiDecision(value) {
   }
 }
 
+function normalizeSkillAudit(value) {
+  if (!value || typeof value !== 'object') return undefined
+  const applicable = (Array.isArray(value.applicable) ? value.applicable : []).slice(0, 32).map((item) => ({
+    id: String(item?.id || '').trim().slice(0, 80),
+    version: String(item?.version || '').trim().slice(0, 40),
+    status: 'APPLICABLE',
+  })).filter((item) => item.id)
+  const skipped = (Array.isArray(value.skipped) ? value.skipped : []).slice(0, 32).map((item) => ({
+    id: String(item?.id || '').trim().slice(0, 80),
+    version: String(item?.version || '').trim().slice(0, 40),
+    status: 'NOT_APPLICABLE',
+    reason: String(item?.reason || '').trim().slice(0, 240),
+  })).filter((item) => item.id)
+  return applicable.length || skipped.length ? { applicable, skipped } : undefined
+}
+
 function withTimeout(promise, timeoutMs, message) {
   let timer
   return Promise.race([
@@ -180,7 +198,51 @@ function movingAverage(type, values, period) {
   return (type === 'SMA' ? SMA : EMA).calculate({ values, period })
 }
 
-function evaluateStrategy(agent, candles) {
+function supertrendStates(candles, period, multiplier) {
+  const atrValues = ATR.calculate({
+    high: candles.map((candle) => finiteNumber(candle.high)),
+    low: candles.map((candle) => finiteNumber(candle.low)),
+    close: candles.map((candle) => finiteNumber(candle.close)),
+    period,
+  })
+  const offset = candles.length - atrValues.length
+  const states = []
+  let finalUpper
+  let finalLower
+  let direction
+
+  for (let index = 0; index < atrValues.length; index += 1) {
+    const candleIndex = offset + index
+    const candle = candles[candleIndex]
+    const atr = finiteNumber(atrValues[index])
+    const midpoint = (finiteNumber(candle.high) + finiteNumber(candle.low)) / 2
+    const basicUpper = midpoint + multiplier * atr
+    const basicLower = midpoint - multiplier * atr
+
+    if (index === 0) {
+      finalUpper = basicUpper
+      finalLower = basicLower
+      direction = finiteNumber(candle.close) >= midpoint ? 'long' : 'short'
+    } else {
+      const previousClose = finiteNumber(candles[candleIndex - 1].close)
+      const previousUpper = finalUpper
+      const previousLower = finalLower
+      finalUpper = basicUpper < previousUpper || previousClose > previousUpper ? basicUpper : previousUpper
+      finalLower = basicLower > previousLower || previousClose < previousLower ? basicLower : previousLower
+      if (direction === 'long' && finiteNumber(candle.close) < finalLower) direction = 'short'
+      else if (direction === 'short' && finiteNumber(candle.close) > finalUpper) direction = 'long'
+    }
+
+    states.push({
+      direction,
+      value: direction === 'long' ? finalLower : finalUpper,
+      atr,
+    })
+  }
+  return states
+}
+
+export function evaluateAgentStrategy(agent, candles) {
   const closes = candles.map((candle) => finiteNumber(candle.close))
   if (closes.some((close) => !(close > 0))) return null
   const params = agent.params || {}
@@ -247,6 +309,48 @@ function evaluateStrategy(agent, candles) {
     const currentClose = tail(closes)
     if (previousClose < previousBand.lower && currentClose >= currentBand.lower) return { direction: 'long', reason: '价格从布林下轨外重新收回通道' }
     if (previousClose > previousBand.upper && currentClose <= currentBand.upper) return { direction: 'short', reason: '价格从布林上轨外重新收回通道' }
+    return null
+  }
+
+  if (agent.strategy === 'supertrend') {
+    const atrPeriod = integer(params.atrPeriod, 10, 2, 100)
+    const multiplier = clamp(finiteNumber(params.multiplier, 3), 0.5, 10)
+    if (candles.length < atrPeriod + 3) return null
+    const states = supertrendStates(candles, atrPeriod, multiplier)
+    const previous = tail(states, 1)
+    const current = tail(states)
+    if (!previous || !current || !(current.atr > 0) || !Number.isFinite(current.value)) return null
+    const stopDistance = Math.abs(tail(closes) - current.value)
+    const details = `${atrPeriod} 周期 ATR × ${multiplier}`
+    if (previous.direction !== current.direction) {
+      return {
+        direction: current.direction,
+        stopDistance: stopDistance > 0 ? stopDistance : current.atr * multiplier,
+        reason: `Supertrend ${details} 翻转为${current.direction === 'long' ? '多头' : '空头'}`,
+      }
+    }
+    return null
+  }
+
+  if (agent.strategy === 'macd-momentum') {
+    const fastPeriod = integer(params.fastPeriod, 12, 2, 100)
+    const slowPeriod = integer(params.slowPeriod, 26, fastPeriod + 1, 300)
+    const signalPeriod = integer(params.signalPeriod, 9, 2, 100)
+    if (closes.length < slowPeriod + signalPeriod + 2) return null
+    const values = MACD.calculate({
+      values: closes,
+      fastPeriod,
+      slowPeriod,
+      signalPeriod,
+      SimpleMAOscillator: false,
+      SimpleMASignal: false,
+    }).filter((value) => Number.isFinite(value.MACD) && Number.isFinite(value.signal) && Number.isFinite(value.histogram))
+    const previous = tail(values, 1)
+    const current = tail(values)
+    if (!previous || !current) return null
+    const details = `${fastPeriod}/${slowPeriod}/${signalPeriod}`
+    if (previous.histogram <= 0 && current.histogram > 0) return { direction: 'long', reason: `MACD ${details} 柱线由负转正，动量转多` }
+    if (previous.histogram >= 0 && current.histogram < 0) return { direction: 'short', reason: `MACD ${details} 柱线由正转负，动量转空` }
     return null
   }
 
@@ -731,7 +835,7 @@ export class AgentRuntime {
         || matchingPositions[0]
       agent.runtime.position = position?.side === 'SHORT' ? 'short' : position ? 'long' : 'flat'
       await this.#log(agent.id, 'POSITION_RECONCILED', 'info', `当前策略持仓：${agent.runtime.position}`, { candleTime, position: position || null })
-      const signal = evaluateStrategy(agent, candles)
+      const signal = evaluateAgentStrategy(agent, candles)
       if (!signal) {
         await this.#log(agent.id, 'SIGNAL_EVALUATED', 'info', '本根闭合 K 线无交易信号', { candleTime, decision: 'NO_ACTION', strategy: agent.strategy })
         await this.#markEvaluationCompleted(agent, candleTime)
@@ -809,6 +913,12 @@ export class AgentRuntime {
   async #supervisePreparedOrder(agent, context) {
     const intelligence = normalizeIntelligence(agent.intelligence)
     const candidateOrder = structuredClone(context.order)
+    if (agent.marketType === 'futures') {
+      const leverage = finiteNumber(context.snapshot.futuresConfig?.leverage ?? context.position?.leverage)
+      const marginType = context.snapshot.futuresConfig?.marginType || context.position?.marginType
+      if (!(finiteNumber(candidateOrder.leverage) > 0) && leverage > 0) candidateOrder.leverage = leverage
+      if (!candidateOrder.marginType && ['CROSSED', 'ISOLATED'].includes(marginType)) candidateOrder.marginType = marginType
+    }
     const request = {
       agent: {
         id: agent.id,
@@ -839,7 +949,9 @@ export class AgentRuntime {
         availableBalance: context.snapshot.availableBalance,
         unrealizedPnl: context.snapshot.unrealizedPnl,
         todayPnl: context.snapshot.todayPnl,
-        position: context.position,
+        fundingPnlToday: context.snapshot.fundingPnlToday,
+        futuresConfig: context.snapshot.futuresConfig ? structuredClone(context.snapshot.futuresConfig) : null,
+        position: context.position ? structuredClone(context.position) : null,
       },
     }
     await this.#log(agent.id, 'AI_CONTEXT_READY', 'info', 'AI 监督上下文已冻结，候选订单不可由模型修改', {
@@ -868,6 +980,7 @@ export class AgentRuntime {
         return false
       }
       const result = normalizeAiDecision(rawDecision)
+      const skillAudit = normalizeSkillAudit(rawDecision?.skillAudit)
       const metadata = {
         candleTime: context.candleTime,
         decision: result.decision,
@@ -877,6 +990,7 @@ export class AgentRuntime {
         model: result.model || intelligence.model || null,
         usage: result.usage || null,
         candidateOrder,
+        ...(skillAudit ? { skillAudit } : {}),
       }
       if (result.decision !== 'APPROVE') {
         await this.#log(agent.id, 'AI_REJECTED', 'warning', result.reason, metadata)

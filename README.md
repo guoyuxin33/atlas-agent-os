@@ -27,10 +27,10 @@ Spot positions cannot open a naked short. Use USDT-M Futures when a strategy mus
 ### Agent runtime and AI
 
 - Editable Agents with symbol, Spot/Futures market, environment, interval, strategy, long-only/short-only/auto direction, risk per trade, notional cap, and intelligence settings.
-- Five built-in live strategies: moving-average crossover, Donchian breakout, RSI reversal, Bollinger reversion, and ATR breakout.
+- Seven built-in live strategies: moving-average crossover, Donchian breakout, RSI reversal, Bollinger reversion, ATR breakout, Supertrend, and MACD momentum.
 - Closed-candle execution in the Electron main process, immediate evaluation, reconnect catch-up, retry handling, persisted runtime state, and step-by-step audit logs.
 - Strategy-only and AI-supervised decision modes. AI supervision fails closed when the selected model, Skill, or MCP tool is unavailable, and approved decisions must still pass deterministic risk controls.
-- Per-Agent Skill selection, MCP server binding, and an explicit MCP tool allowlist.
+- Per-Agent Skill selection, MCP server binding, and an explicit MCP tool allowlist. Skills are filtered by market applicability and receive bounded market/account/order inputs rather than unrestricted application state.
 - Production Agent intents require per-order confirmation and expire if they are not approved in time.
 
 ![Atlas Agent runtime and AI supervision](docs/assets/agents.png)
@@ -41,11 +41,12 @@ Spot positions cannot open a naked short. Use USDT-M Futures when a strategy mus
 - Native Anthropic and Gemini protocols plus OpenAI-compatible Chat Completions/Responses routing.
 - Provider presets for OpenAI, Anthropic, Gemini, DeepSeek, Qwen, Kimi, MiniMax, OpenRouter, CCSwitch, Ollama, LM Studio, and custom compatible endpoints.
 - Model discovery, manual model entry, and configurable reasoning effort where the provider supports it.
-- Built-in Skills and Streamable HTTP MCP discovery/calls with tool authorization. Local stdio MCP servers are not yet supported.
+- Six versioned Skills for market regime, risk budget, execution quality, Futures carry/liquidation risk, sourced news, and strategy consistency. Each declares required, optional, and prohibited inputs.
+- Streamable HTTP MCP discovery/calls with tool authorization. Local stdio MCP servers are not yet supported.
 
 ### Strategy review and desktop safety
 
-- Local strategy parameter editing and Paper backtests over real public candle history.
+- Local strategy parameter editing and Paper backtests over real public candle history, including Supertrend and MACD momentum baselines.
 - Order, position, Agent-log, review, and export views.
 - Credentials encrypted through Electron `safeStorage`; secrets are never returned to the renderer process.
 - `contextIsolation`, renderer sandboxing, Node.js integration disabled, and single-instance protection.
@@ -54,7 +55,7 @@ Spot positions cannot open a naked short. Use USDT-M Futures when a strategy mus
 
 ## Run locally
 
-Requirements: a current Node.js/npm installation and macOS, Windows, or Linux supported by Electron.
+Requirements: Node.js `20.19+` or `22.13+` LTS with npm, and macOS, Windows, or Linux supported by Electron.
 
 ```bash
 npm install

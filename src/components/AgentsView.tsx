@@ -32,6 +32,12 @@ import type {
 import { MarketSelector } from './MarketSelector'
 import { Modal } from './Modal'
 import { builtInSkills } from '../skills'
+import {
+  createAgentParameterDraft,
+  mergeAgentParameters,
+  validateAgentParameterDraft,
+  type AgentParameterDraft,
+} from '../lib/agent-params'
 
 const strategyLabels: Record<AgentStrategy, string> = {
   'ma-crossover': '均线交叉',
@@ -39,6 +45,82 @@ const strategyLabels: Record<AgentStrategy, string> = {
   rsi: 'RSI 反转',
   bollinger: '布林带回归',
   'atr-breakout': 'ATR 突破',
+  supertrend: 'Supertrend 趋势',
+  'macd-momentum': 'MACD 动量',
+}
+
+interface AgentParameterFieldProps {
+  id: string
+  label: string
+  value: string
+  suffix?: string
+  min: number
+  max: number
+  step?: number
+  onChange: (value: string) => void
+}
+
+function AgentParameterField({ id, label, value, suffix, min, max, step = 1, onChange }: AgentParameterFieldProps) {
+  return <div>
+    <label className="field-label" htmlFor={id}>{label}</label>
+    <div className="input-shell">
+      <input id={id} type="number" value={value} min={min} max={max} step={step} onChange={(event) => onChange(event.target.value)} />
+      {suffix && <span>{suffix}</span>}
+    </div>
+  </div>
+}
+
+interface AgentStrategyParameterFieldsProps {
+  strategy: AgentStrategy
+  draft: AgentParameterDraft
+  onChange: (key: string, value: string) => void
+}
+
+function AgentStrategyParameterFields({ strategy, draft, onChange }: AgentStrategyParameterFieldsProps) {
+  const field = (key: string) => ({ value: draft[key] || '', onChange: (value: string) => onChange(key, value) })
+
+  if (strategy === 'ma-crossover') return <>
+    <div><label className="field-label" htmlFor="agent-ma-type">均线类型</label><select id="agent-ma-type" className="select-field" value={draft.maType || 'EMA'} onChange={(event) => onChange('maType', event.target.value)}><option value="EMA">EMA 指数均线</option><option value="SMA">SMA 简单均线</option></select></div>
+    <AgentParameterField id="agent-fast-period" label="快线周期" min={2} max={499} suffix="K 线" {...field('fastPeriod')} />
+    <AgentParameterField id="agent-slow-period" label="慢线周期" min={3} max={500} suffix="K 线" {...field('slowPeriod')} />
+    <AgentParameterField id="agent-stop-percent" label="固定止损" min={0.1} max={20} step={0.1} suffix="%" {...field('stopPercent')} />
+  </>
+
+  if (strategy === 'donchian') return <>
+    <AgentParameterField id="agent-entry-period" label="入场通道" min={3} max={500} suffix="K 线" {...field('entryPeriod')} />
+    <AgentParameterField id="agent-exit-period" label="退出通道" min={2} max={499} suffix="K 线" {...field('exitPeriod')} />
+    <AgentParameterField id="agent-stop-percent" label="固定止损" min={0.1} max={20} step={0.1} suffix="%" {...field('stopPercent')} />
+  </>
+
+  if (strategy === 'rsi') return <>
+    <AgentParameterField id="agent-rsi-period" label="RSI 周期" min={2} max={500} suffix="K 线" {...field('period')} />
+    <AgentParameterField id="agent-rsi-oversold" label="超卖阈值" min={1} max={49} step={0.1} {...field('oversold')} />
+    <AgentParameterField id="agent-rsi-overbought" label="超买阈值" min={51} max={99} step={0.1} {...field('overbought')} />
+    <AgentParameterField id="agent-stop-percent" label="固定止损" min={0.1} max={20} step={0.1} suffix="%" {...field('stopPercent')} />
+  </>
+
+  if (strategy === 'bollinger') return <>
+    <AgentParameterField id="agent-bollinger-period" label="布林带周期" min={2} max={500} suffix="K 线" {...field('period')} />
+    <AgentParameterField id="agent-bollinger-deviation" label="标准差倍数" min={0.5} max={5} step={0.1} suffix="σ" {...field('stdDev')} />
+    <AgentParameterField id="agent-stop-percent" label="固定止损" min={0.1} max={20} step={0.1} suffix="%" {...field('stopPercent')} />
+  </>
+
+  if (strategy === 'atr-breakout') return <>
+    <AgentParameterField id="agent-atr-period" label="ATR 周期" min={2} max={500} suffix="K 线" {...field('atrPeriod')} />
+    <AgentParameterField id="agent-atr-multiple" label="突破倍数" min={0.1} max={10} step={0.1} suffix="ATR" {...field('atrMultiple')} />
+  </>
+
+  if (strategy === 'supertrend') return <>
+    <AgentParameterField id="agent-supertrend-period" label="ATR 周期" min={2} max={100} suffix="K 线" {...field('atrPeriod')} />
+    <AgentParameterField id="agent-supertrend-multiplier" label="趋势倍数" min={0.5} max={10} step={0.1} suffix="ATR" {...field('multiplier')} />
+  </>
+
+  return <>
+    <AgentParameterField id="agent-macd-fast" label="快线周期" min={2} max={100} suffix="K 线" {...field('fastPeriod')} />
+    <AgentParameterField id="agent-macd-slow" label="慢线周期" min={3} max={300} suffix="K 线" {...field('slowPeriod')} />
+    <AgentParameterField id="agent-macd-signal" label="信号周期" min={2} max={100} suffix="K 线" {...field('signalPeriod')} />
+    <AgentParameterField id="agent-stop-percent" label="固定止损" min={0.1} max={20} step={0.1} suffix="%" {...field('stopPercent')} />
+  </>
 }
 
 const eventLabels: Record<string, string> = {
@@ -430,6 +512,7 @@ export function AgentCreateModal({ agent, initialEnvironment, initialMarketType,
   const [symbol, setSymbol] = useState(agent?.symbol || initialSymbol)
   const [interval, setInterval] = useState<MarketInterval>(agent?.interval || '15m')
   const [strategy, setStrategy] = useState<AgentStrategy>(agent?.strategy || 'ma-crossover')
+  const [strategyParams, setStrategyParams] = useState<AgentParameterDraft>(() => createAgentParameterDraft(agent?.strategy || 'ma-crossover', agent?.params))
   const [riskPercent, setRiskPercent] = useState(String((agent?.risk.riskFraction ?? 0.005) * 100))
   const [maxNotional, setMaxNotional] = useState(String(agent?.risk.maxNotional ?? 100))
   const [maxQuantity, setMaxQuantity] = useState(agent?.risk.maxQuantity ? String(agent.risk.maxQuantity) : '')
@@ -447,6 +530,16 @@ export function AgentCreateModal({ agent, initialEnvironment, initialMarketType,
   const connectedMcpToolNames = new Set(mcpConnection?.tools.map((tool) => tool.name) || [])
   const unavailableMcpTools = [...selectedMcpTools].filter((name) => !connectedMcpToolNames.has(name))
 
+  const changeStrategy = (nextStrategy: AgentStrategy) => {
+    setStrategy(nextStrategy)
+    setStrategyParams(createAgentParameterDraft(nextStrategy))
+    setError(null)
+  }
+
+  const changeStrategyParam = (key: string, value: string) => {
+    setStrategyParams((current) => ({ ...current, [key]: value }))
+  }
+
   const submit = async () => {
     const riskFraction = Number(riskPercent) / 100
     const notional = Number(maxNotional)
@@ -454,6 +547,8 @@ export function AgentCreateModal({ agent, initialEnvironment, initialMarketType,
     const confidenceThreshold = Number(confidencePercent) / 100
     if (!name.trim()) return setError('请输入 Agent 名称')
     if (!symbol.trim()) return setError('请选择交易对')
+    const parameterValidation = validateAgentParameterDraft(strategy, strategyParams)
+    if (!parameterValidation.ok) return setError(parameterValidation.error)
     if (!(riskFraction >= 0.0001 && riskFraction <= 0.01)) return setError('单笔风险必须在净值的 0.01% 到 1% 之间')
     if (!(notional >= 1)) return setError('名义价值上限必须至少为 1 USDT')
     if (quantity !== undefined && !(quantity > 0)) return setError('数量上限必须大于 0，或留空使用名义价值上限')
@@ -473,6 +568,7 @@ export function AgentCreateModal({ agent, initialEnvironment, initialMarketType,
         symbol,
         interval,
         strategy,
+        params: mergeAgentParameters(strategy, agent?.strategy, agent?.params, parameterValidation.params),
         risk: { riskFraction, maxNotional: notional, ...(quantity !== undefined ? { maxQuantity: quantity } : {}) },
         intelligence: intelligenceMode === 'ai-supervised' ? {
           mode: intelligenceMode,
@@ -521,11 +617,16 @@ export function AgentCreateModal({ agent, initialEnvironment, initialMarketType,
             <div><label className="field-label" htmlFor="agent-position-mode">持仓方向</label><select id="agent-position-mode" className="select-field" value={positionMode} onChange={(event) => setPositionMode(event.target.value as AgentPositionMode)} disabled={marketType === 'spot'}><option value="long-only">仅做多</option><option value="short-only">仅做空</option><option value="auto">自动多空</option></select></div>
             <div><label className="field-label">交易对</label><div className="agent-market-picker"><MarketSelector environment={environment} marketType={marketType} value={symbol} onChange={setSymbol} /></div></div>
             <div><label className="field-label" htmlFor="agent-interval">K 线周期</label><select id="agent-interval" className="select-field" value={interval} onChange={(event) => setInterval(event.target.value as MarketInterval)}>{(['1m', '5m', '15m', '1h', '4h', '1d'] as MarketInterval[]).map((value) => <option value={value} key={value}>{value}</option>)}</select></div>
-            <div><label className="field-label" htmlFor="agent-strategy">策略</label><select id="agent-strategy" className="select-field" value={strategy} onChange={(event) => setStrategy(event.target.value as AgentStrategy)}>{Object.entries(strategyLabels).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></div>
+            <div><label className="field-label" htmlFor="agent-strategy">策略</label><select id="agent-strategy" className="select-field" value={strategy} onChange={(event) => changeStrategy(event.target.value as AgentStrategy)}>{Object.entries(strategyLabels).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></div>
             <div><label className="field-label" htmlFor="agent-risk">单笔风险</label><div className="input-shell"><input id="agent-risk" value={riskPercent} onChange={(event) => setRiskPercent(event.target.value)} inputMode="decimal" /><span>% 净值</span></div></div>
             <div><label className="field-label" htmlFor="agent-notional">名义价值上限</label><div className="input-shell"><input id="agent-notional" value={maxNotional} onChange={(event) => setMaxNotional(event.target.value)} inputMode="decimal" /><span>USDT</span></div></div>
             <div><label className="field-label" htmlFor="agent-quantity">数量上限（可选）</label><div className="input-shell"><input id="agent-quantity" value={maxQuantity} onChange={(event) => setMaxQuantity(event.target.value)} inputMode="decimal" placeholder="按名义价值限制" /></div></div>
           </div>
+
+          <section className="agent-strategy-config">
+            <header><strong>{strategyLabels[strategy]}参数</strong><span>参数将在下次启动时生效</span></header>
+            <div className="agent-strategy-fields"><AgentStrategyParameterFields strategy={strategy} draft={strategyParams} onChange={changeStrategyParam} /></div>
+          </section>
 
           {intelligenceMode === 'ai-supervised' && <section className="agent-ai-config">
             <header><div><BrainCircuit size={16} /><span><strong>监督能力</strong><small>{modelConfigured ? '模型路由已验证' : editing ? '保存后需验证当前模型路由' : '模型尚未配置或验证'}</small></span></div><span className={modelConfigured ? 'healthy-label' : 'warning-label'}><StatusDot live={modelConfigured} />{modelConfigured ? '可用' : '需验证'}</span></header>

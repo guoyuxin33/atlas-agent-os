@@ -119,7 +119,7 @@ try {
   } = await import('../electron/services/binance.mjs')
   const { ExchangeInfoCatalog } = await import('../electron/services/exchange-info.mjs')
   const { AgentRuntime } = await import('../electron/services/agent-runtime.mjs')
-  const { authorizeAgentMcpTools, buildAgentSupervisorSystem, resolveAgentSkills } = await import('../electron/services/ai.mjs')
+  const { authorizeAgentMcpTools, buildAgentSupervisionContext, buildAgentSupervisorSystem, buildAssistantSystem, partitionAgentSkills, resolveAgentSkills } = await import('../electron/services/ai.mjs')
   const { saveVault } = await import('../electron/services/vault.mjs')
 
   await verify('Binance 签名时间校准与成交聚合', async () => {
@@ -716,15 +716,46 @@ try {
   })
 
   await verify('Agent AI 监督批准、拒绝、故障关闭与 Live 待确认', async () => {
-    const skillSystem = buildAgentSupervisorSystem(['risk-review'])
-    const riskSkill = resolveAgentSkills(['risk-review'])[0]
+    const selectedSkillIds = ['market-analysis', 'risk-review', 'execution-quality', 'futures-carry-risk']
+    const selectedSkills = resolveAgentSkills(selectedSkillIds)
+    const skillSystem = buildAgentSupervisorSystem(selectedSkillIds)
+    const riskSkill = selectedSkills.find((skill) => skill.id === 'risk-review')
     assert(skillSystem.includes(`[受信任 Skill risk-review@${riskSkill.version}]`) && skillSystem.includes(riskSkill.instructions), '受信任 Skill 的完整版本化指令没有注入监督 system')
+    assert(selectedSkills.every((skill) => skill.inputBoundary.required.length && skill.inputBoundary.prohibited.length), '成熟 Skill 缺少明确输入边界')
+    assert(skillSystem.includes('任一 Skill 否决则最终 REJECT') && skillSystem.includes('execution-quality'), '监督 system 没有要求逐项执行 Skill')
+    const assistantSystem = buildAssistantSystem({ skills: ['market-analysis', 'execution-quality'], context: { symbol: 'BTCUSDT', price: 100 } }, [])
+    assert(assistantSystem.includes('[受信任 Skill market-analysis@2.0.0]') && assistantSystem.includes('[受信任 Skill execution-quality@1.0.0]'), 'AI 对话没有注入版本化 Skill 指令')
+    assert(assistantSystem.includes('当前上下文') && assistantSystem.includes('BTCUSDT'), 'AI 对话没有携带行情上下文')
     await expectReject(async () => resolveAgentSkills(['front-end-injected-instructions']), /未知 Skill/)
     const discoveredMcp = [{ url: 'https://mcp.example.test/rpc', tools: [{ name: 'market.read' }, { name: 'orders.submit' }] }]
     assert(authorizeAgentMcpTools(discoveredMcp, [])[0].tools.length === 0, '空 MCP 白名单不应向模型暴露任何工具')
     const authorizedMcp = authorizeAgentMcpTools(discoveredMcp, ['market.read'])
     assert(authorizedMcp[0].tools.length === 1 && authorizedMcp[0].tools[0].name === 'market.read', 'MCP 工具白名单没有精确过滤')
     await expectReject(async () => authorizeAgentMcpTools(discoveredMcp, ['unknown.tool']), /未提供的工具/)
+    const skillCandles = Array.from({ length: 30 }, (_, index) => ({
+      time: index + 1,
+      open: 100 + index * 0.2,
+      high: 101 + index * 0.2,
+      low: 99 + index * 0.2,
+      close: 100.5 + index * 0.2,
+      volume: 100 + index,
+    }))
+    const supervisionContext = buildAgentSupervisionContext({
+      agent: { id: 'skill-agent', strategy: 'ma-crossover', environment: 'paper', marketType: 'futures', positionMode: 'auto', symbol: 'BTCUSDT', interval: '15m', params: {}, risk: { riskFraction: 0.005, maxNotional: 500 } },
+      intelligence: { mode: 'ai-supervised', skills: selectedSkillIds },
+      candidateOrder: { environment: 'paper', marketType: 'futures', symbol: 'BTCUSDT', side: 'BUY', type: 'MARKET', quantity: '0.01', marketPrice: '105', leverage: 5, marginType: 'CROSSED', reduceOnly: false },
+      signal: { direction: 'long', reason: '均线向上交叉' },
+      candleTime: 30,
+      candles: skillCandles,
+      account: { totalWalletBalance: 25_000, availableBalance: 20_000, unrealizedPnl: 20, todayPnl: 15, position: { side: 'LONG', markPrice: '105', liquidationPrice: '82', leverage: '5', marginRatio: '0.08' } },
+    }, authorizedMcp)
+    assert(supervisionContext.selectedSkills.map((skill) => skill.id).join(',') === selectedSkillIds.join(','), '监督上下文没有携带选择的 Skill')
+    assert(supervisionContext.recentCandles.length === 30 && supervisionContext.signal.direction === 'long' && supervisionContext.account.totalWalletBalance === 25_000, '监督上下文缺少行情、账户或策略信号')
+    assert(supervisionContext.skillInputs['market-analysis'].derived.regime.closedCandleCount === 30, '市场状态 Skill 没有获得闭合 K 线派生指标')
+    assert(supervisionContext.skillInputs['risk-review'].derived.riskBudget.candidateNotional > 0, '风险预算 Skill 没有获得候选仓位指标')
+    assert(supervisionContext.skillInputs['execution-quality'].derived.execution.candidateToAverageCandleTurnover > 0, '执行质量 Skill 没有获得流动性代理指标')
+    assert(supervisionContext.skillInputs['futures-carry-risk'].derived.futuresRisk.liquidationBufferPct > 0, '合约 Skill 没有获得清算缓冲指标')
+    assert(supervisionContext.skillInputs['futures-carry-risk'].derived.futuresRisk.fundingRateAvailable === false, '缺失资金费率时不得伪造可用数据')
     const crossingCandles = [100, 100, 100, 90, 110].map((close, index) => ({
       time: index + 1,
       open: close,
@@ -733,6 +764,84 @@ try {
       close,
       volume: 10,
     }))
+    const captureRuntimeSupervision = async ({ name, marketType, skills, snapshot }) => {
+      let capturedRequest
+      let adapterCalls = 0
+      const runtime = new AgentRuntime({
+        dataDirectory: join(userDataDirectory, `agents-ai-context-${name}`),
+        marketHub: {
+          subscribeInternal() { return () => {} },
+          async history() { return crossingCandles },
+        },
+        superviseCandidate: async (request) => {
+          capturedRequest = structuredClone(request)
+          const partitioned = partitionAgentSkills(request.intelligence.skills, request.agent.marketType)
+          return {
+            decision: 'REJECT',
+            confidence: 0.99,
+            reason: 'QA 仅捕获监督上下文，不允许执行订单',
+            skillAudit: {
+              applicable: partitioned.applicable.map(({ id, version }) => ({ id, version, status: 'APPLICABLE' })),
+              skipped: partitioned.skipped,
+            },
+          }
+        },
+        placeOrder: async () => { adapterCalls += 1; throw new Error('上下文 QA 不得调用订单适配器') },
+        getAccountSnapshot: async () => structuredClone(snapshot),
+        isExecutionHalted: () => false,
+      })
+      const agent = await runtime.create({
+        name: `QA Skill Context ${name}`,
+        strategy: 'ma-crossover',
+        environment: 'paper',
+        marketType,
+        positionMode: marketType === 'futures' ? 'auto' : 'long-only',
+        symbol: 'BTCUSDT',
+        interval: '1m',
+        params: { maType: 'EMA', fastPeriod: 2, slowPeriod: 3 },
+        risk: { riskFraction: 0.005, maxNotional: 100 },
+        intelligence: { mode: 'ai-supervised', model: 'qa-model', skills, mcpServers: [], mcpTools: [], confidenceThreshold: 0.7, failClosed: true },
+      })
+      await runtime.start(agent.id)
+      await waitFor(async () => (await runtime.logs({ agentId: agent.id, limit: 100 })).some((event) => event.type === 'COMPLETED'))
+      const logs = await runtime.logs({ agentId: agent.id, limit: 100 })
+      await runtime.pause(agent.id)
+      await runtime.close()
+      assert(capturedRequest, `${name} 没有从 AgentRuntime 捕获监督请求`)
+      assert(adapterCalls === 0, `${name} 上下文 QA 意外调用订单适配器 ${adapterCalls} 次`)
+      return { request: capturedRequest, logs }
+    }
+    const emptyFutures = await captureRuntimeSupervision({
+      name: 'empty-futures',
+      marketType: 'futures',
+      skills: selectedSkillIds,
+      snapshot: {
+        totalWalletBalance: 25_000,
+        availableBalance: 24_000,
+        unrealizedPnl: 0,
+        todayPnl: -3,
+        fundingPnlToday: -3,
+        futuresConfig: { symbol: 'BTCUSDT', leverage: 12, marginType: 'ISOLATED', isolatedMargin: 0, positionAmt: 0, positionMode: 'ONE_WAY', positionSide: 'BOTH' },
+        portfolio: [],
+      },
+    })
+    assert(emptyFutures.request.candidateOrder.leverage === 12 && emptyFutures.request.candidateOrder.marginType === 'ISOLATED', '空仓合约监督候选没有从账户配置补齐杠杆和保证金模式')
+    assert(emptyFutures.request.account.futuresConfig.leverage === 12 && emptyFutures.request.account.fundingPnlToday === -3, 'AgentRuntime 监督账户快照缺少 futuresConfig 或 fundingPnlToday')
+    const emptyFuturesContext = buildAgentSupervisionContext(emptyFutures.request)
+    const emptyFuturesRisk = emptyFuturesContext.skillInputs['futures-carry-risk'].derived.futuresRisk
+    assert(emptyFuturesRisk.leverage === 12 && emptyFuturesRisk.marginType === 'ISOLATED' && emptyFuturesRisk.positionMode === 'ONE_WAY', '空仓合约 Skill 没有从账户配置正确回退')
+    const spotSkipped = await captureRuntimeSupervision({
+      name: 'spot-skip-futures-skill',
+      marketType: 'spot',
+      skills: ['market-analysis', 'futures-carry-risk'],
+      snapshot: { totalWalletBalance: 25_000, availableBalance: 25_000, unrealizedPnl: 0, todayPnl: 0, portfolio: [] },
+    })
+    const spotContext = buildAgentSupervisionContext(spotSkipped.request)
+    assert(spotContext.selectedSkills.map((skill) => skill.id).join(',') === 'market-analysis', 'Spot 监督上下文仍把合约 Skill 当作必做项')
+    assert(!spotContext.skillInputs['futures-carry-risk'], 'Spot 监督上下文不应构建合约 Skill 输入')
+    assert(spotContext.skippedSkills.some((skill) => skill.id === 'futures-carry-risk' && skill.status === 'NOT_APPLICABLE'), 'Spot 合约 Skill 没有确定性标记 NOT_APPLICABLE')
+    const spotAuditLog = spotSkipped.logs.find((event) => event.type === 'AI_REJECTED')
+    assert(spotAuditLog?.data?.skillAudit?.skipped?.some((skill) => skill.id === 'futures-carry-risk' && skill.status === 'NOT_APPLICABLE'), 'Spot 合约 Skill 的 NOT_APPLICABLE 状态没有写入运行时审计')
     const runCase = async ({ name, superviseCandidate, environment = 'paper', marketType = 'spot', confidenceThreshold = 0.7, aiTimeoutMs = 500 }) => {
       const submitted = []
       const marketHub = {

@@ -42,7 +42,7 @@ export function SkillsView({ enabled, onToggle, onToast, mcpConnection, onMcpCon
         <div className="skill-grid">{builtInSkills.map((skill) => {
           const Icon = skill.icon
           const active = enabled.has(skill.id)
-          return <article className={`skill-card ${active ? 'skill-active' : ''}`} key={skill.id}><header><span className="skill-icon"><Icon size={18} /></span><label className="switch"><input type="checkbox" checked={active} onChange={() => onToggle(skill.id)} /><span /></label></header><h3>{skill.name}</h3><p>{skill.description}</p><footer><span><Wrench size={13} />{skill.tools} 个工具</span><strong>{active ? '已启用' : '未启用'}</strong></footer></article>
+          return <article className={`skill-card ${active ? 'skill-active' : ''}`} key={skill.id}><header><span className="skill-icon"><Icon size={18} /></span><label className="switch"><input type="checkbox" checked={active} onChange={() => onToggle(skill.id)} /><span /></label></header><h3>{skill.name}</h3><p>{skill.description}</p><footer><span><Wrench size={13} />{skill.checks} 项审查</span><strong>{active ? '已启用' : '未启用'}</strong></footer></article>
         })}</div>
       </section>
       <section className="skill-section mcp-section">

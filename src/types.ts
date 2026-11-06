@@ -131,7 +131,7 @@ export interface TradingOrder {
   commissionAsset?: string
 }
 
-export type AgentStrategy = 'ma-crossover' | 'donchian' | 'rsi' | 'bollinger' | 'atr-breakout'
+export type AgentStrategy = 'ma-crossover' | 'donchian' | 'rsi' | 'bollinger' | 'atr-breakout' | 'supertrend' | 'macd-momentum'
 export type AgentStatus = 'paused' | 'running'
 export type AgentIntentStatus = 'pending' | 'executed' | 'rejected' | 'expired'
 export type AgentPositionMode = 'long-only' | 'short-only' | 'auto'

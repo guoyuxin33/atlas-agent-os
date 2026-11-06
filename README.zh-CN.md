@@ -27,10 +27,10 @@ Atlas Agent OS 是一个面向数字资产交易的 Electron 桌面工作台。�
 ### Agent 运行时与 AI
 
 - 已有 Agent 可编辑，可配置交易对、现货/合约、环境、周期、策略、仅做多/仅做空/自动方向、单笔风险、名义金额上限和智能能力。
-- 内置五类可运行策略：均线交叉、Donchian 突破、RSI 反转、布林带回归和 ATR 突破。
+- 内置七类可运行策略：均线交叉、Donchian 突破、RSI 反转、布林带回归、ATR 突破、Supertrend 和 MACD 动量。
 - Electron 主进程按闭合 K 线执行，支持立即评估、断线补偿、失败重试、运行状态持久化和逐步审计日志。
 - 支持纯策略与 AI 监督两种决策模式。模型、Skill 或 MCP 不可用时 AI 监督会拒绝该次信号；AI 批准后仍须通过确定性风控。
-- 每个 Agent 可独立选择 Skill、绑定 MCP 服务并配置 MCP 工具白名单。
+- 每个 Agent 可独立选择 Skill、绑定 MCP 服务并配置 MCP 工具白名单。Skill 会按市场适用范围确定性过滤，并只接收受约束的行情、账户和候选订单输入。
 - 生产 Agent 的每笔交易意图都需要人工确认，超时未确认会自动失效。
 
 ![Atlas Agent 运行时与 AI 监督](docs/assets/agents.png)
@@ -41,11 +41,12 @@ Atlas Agent OS 是一个面向数字资产交易的 Electron 桌面工作台。�
 - 原生支持 Anthropic 与 Gemini 协议，同时支持 OpenAI-compatible Chat Completions/Responses。
 - 提供 OpenAI、Anthropic、Gemini、DeepSeek、Qwen、Kimi、MiniMax、OpenRouter、CCSwitch、Ollama、LM Studio 和自定义兼容接口预设。
 - 支持远程发现模型、手动输入模型，以及在厂商支持时选择不同推理强度。
-- 支持内置 Skills 和 Streamable HTTP MCP 工具发现/调用，并要求工具授权。当前暂不支持本地 stdio MCP Server。
+- 提供六个版本化 Skill，覆盖市场状态、风险预算、执行质量、合约资金费率/清算风险、带来源新闻和策略一致性；每个 Skill 都声明必需、可选和禁止输入。
+- 支持 Streamable HTTP MCP 工具发现/调用，并要求工具授权。当前暂不支持本地 stdio MCP Server。
 
 ### 策略复盘与桌面安全
 
-- 可在本地编辑策略参数，并使用真实公开历史 K 线执行模拟回测。
+- 可在本地编辑策略参数，并使用真实公开历史 K 线执行模拟回测，包含 Supertrend 与 MACD 动量基线。
 - 提供订单、持仓、Agent 日志、复盘和导出视图。
 - 凭证通过 Electron `safeStorage` 加密，Secret 不会返回渲染进程。
 - 启用 `contextIsolation` 和渲染器沙箱，禁用 Node.js 集成，并限制应用只能启动一个实例。
@@ -54,7 +55,7 @@ Atlas Agent OS 是一个面向数字资产交易的 Electron 桌面工作台。�
 
 ## 本地运行
 
-需要当前版本的 Node.js/npm，以及 Electron 支持的 macOS、Windows 或 Linux。
+需要 Node.js `20.19+` 或 `22.13+` LTS 与 npm，以及 Electron 支持的 macOS、Windows 或 Linux。
 
 ```bash
 npm install

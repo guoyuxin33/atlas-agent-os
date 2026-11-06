@@ -9,7 +9,12 @@ const defaultStrategies: BacktestStrategyConfig[] = [
   { id: 'ma-crossover', name: '均线趋势跟随', kind: 'ma-crossover', primaryPeriod: 20, secondaryPeriod: 50, feeBps: 4 },
   { id: 'rsi-reversion', name: 'RSI 均值回归', kind: 'rsi-reversion', primaryPeriod: 14, secondaryPeriod: 30, feeBps: 4 },
   { id: 'donchian-breakout', name: 'Donchian 突破', kind: 'donchian-breakout', primaryPeriod: 20, secondaryPeriod: 10, feeBps: 4 },
+  { id: 'supertrend', name: 'Supertrend 趋势', kind: 'supertrend', primaryPeriod: 10, secondaryPeriod: 3, feeBps: 4 },
+  { id: 'macd-momentum', name: 'MACD 动量', kind: 'macd-momentum', primaryPeriod: 12, secondaryPeriod: 26, feeBps: 4 },
 ]
+
+const backtestKinds: BacktestStrategyKind[] = ['ma-crossover', 'rsi-reversion', 'donchian-breakout', 'supertrend', 'macd-momentum']
+const defaultStrategyIds = new Set(defaultStrategies.map((strategy) => strategy.id))
 
 interface StrategyRun extends BacktestResult {
   environment: Environment
@@ -25,12 +30,14 @@ function loadStrategies() {
     const valid = parsed.filter((strategy): strategy is BacktestStrategyConfig => {
       try {
         validateBacktestStrategy(strategy)
-        return typeof strategy.id === 'string' && ['ma-crossover', 'rsi-reversion', 'donchian-breakout'].includes(strategy.kind)
+        return typeof strategy.id === 'string' && backtestKinds.includes(strategy.kind)
       } catch {
         return false
       }
     })
-    return valid.length ? valid : defaultStrategies.map((strategy) => ({ ...strategy }))
+    if (!valid.length) return defaultStrategies.map((strategy) => ({ ...strategy }))
+    const savedIds = new Set(valid.map((strategy) => strategy.id))
+    return [...valid, ...defaultStrategies.filter((strategy) => !savedIds.has(strategy.id)).map((strategy) => ({ ...strategy }))]
   } catch {
     return defaultStrategies.map((strategy) => ({ ...strategy }))
   }
@@ -39,13 +46,25 @@ function loadStrategies() {
 function kindLabel(kind: BacktestStrategyKind) {
   if (kind === 'ma-crossover') return '均线交叉'
   if (kind === 'rsi-reversion') return 'RSI 回归'
-  return 'Donchian 突破'
+  if (kind === 'donchian-breakout') return 'Donchian 突破'
+  if (kind === 'supertrend') return 'Supertrend'
+  return 'MACD 动量'
 }
 
 function periodLabels(kind: BacktestStrategyKind) {
   if (kind === 'ma-crossover') return ['快线周期', '慢线周期']
   if (kind === 'rsi-reversion') return ['RSI 周期', '超买卖阈值']
-  return ['突破周期', '退出周期']
+  if (kind === 'donchian-breakout') return ['突破周期', '退出周期']
+  if (kind === 'supertrend') return ['ATR 周期', 'ATR 倍数']
+  return ['MACD 快线周期', 'MACD 慢线周期（信号线 9）']
+}
+
+function defaultPeriods(kind: BacktestStrategyKind) {
+  if (kind === 'rsi-reversion') return { primaryPeriod: 14, secondaryPeriod: 30 }
+  if (kind === 'donchian-breakout') return { primaryPeriod: 20, secondaryPeriod: 10 }
+  if (kind === 'supertrend') return { primaryPeriod: 10, secondaryPeriod: 3 }
+  if (kind === 'macd-momentum') return { primaryPeriod: 12, secondaryPeriod: 26 }
+  return { primaryPeriod: 20, secondaryPeriod: 50 }
 }
 
 function percent(value: number, signed = false) {
@@ -78,7 +97,12 @@ export function StrategiesView({ environment, marketType, symbol, interval, onTo
   const saveDraft = () => {
     if (!draft) return
     try {
-      const normalized = { ...draft, name: draft.name.trim(), primaryPeriod: Math.round(draft.primaryPeriod), secondaryPeriod: Math.round(draft.secondaryPeriod) }
+      const normalized = {
+        ...draft,
+        name: draft.name.trim(),
+        primaryPeriod: Math.round(draft.primaryPeriod),
+        secondaryPeriod: draft.kind === 'supertrend' ? Number(draft.secondaryPeriod.toFixed(2)) : Math.round(draft.secondaryPeriod),
+      }
       validateBacktestStrategy(normalized)
       const exists = strategies.some((strategy) => strategy.id === normalized.id)
       persistStrategies(exists ? strategies.map((strategy) => strategy.id === normalized.id ? normalized : strategy) : [...strategies, normalized])
@@ -140,11 +164,11 @@ export function StrategiesView({ environment, marketType, symbol, interval, onTo
     })}</div>
     {draft && <Modal title={strategies.some((strategy) => strategy.id === draft.id) ? '编辑策略参数' : '新建本地策略'} subtitle="配置保存在本机，回测只读取公开历史行情" onClose={() => setDraft(null)}><div className="close-position-form">
       <label className="field-label" htmlFor="strategy-name">策略名称</label><div className="input-shell"><input id="strategy-name" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></div>
-      <label className="field-label">策略逻辑</label><div className="segmented order-type">{(['ma-crossover', 'rsi-reversion', 'donchian-breakout'] as BacktestStrategyKind[]).map((kind) => <button key={kind} className={draft.kind === kind ? 'active' : ''} onClick={() => setDraft({ ...draft, kind, primaryPeriod: kind === 'rsi-reversion' ? 14 : 20, secondaryPeriod: kind === 'ma-crossover' ? 50 : kind === 'rsi-reversion' ? 30 : 10 })}>{kindLabel(kind)}</button>)}</div>
+      <label className="field-label">策略逻辑</label><select className="select-field" value={draft.kind} onChange={(event) => { const kind = event.target.value as BacktestStrategyKind; setDraft({ ...draft, kind, ...defaultPeriods(kind) }) }}>{backtestKinds.map((kind) => <option key={kind} value={kind}>{kindLabel(kind)}</option>)}</select>
       <label className="field-label" htmlFor="strategy-primary">{periodLabels(draft.kind)[0]}</label><div className="input-shell"><input id="strategy-primary" type="number" min="2" max="500" value={draft.primaryPeriod} onChange={(event) => setDraft({ ...draft, primaryPeriod: Number(event.target.value) })} /><span>根</span></div>
-      <label className="field-label" htmlFor="strategy-secondary">{periodLabels(draft.kind)[1]}</label><div className="input-shell"><input id="strategy-secondary" type="number" min="2" max="500" value={draft.secondaryPeriod} onChange={(event) => setDraft({ ...draft, secondaryPeriod: Number(event.target.value) })} /><span>{draft.kind === 'rsi-reversion' ? '%' : '根'}</span></div>
+      <label className="field-label" htmlFor="strategy-secondary">{periodLabels(draft.kind)[1]}</label><div className="input-shell"><input id="strategy-secondary" type="number" min={draft.kind === 'supertrend' ? 0.5 : 2} max={draft.kind === 'supertrend' ? 10 : 500} step={draft.kind === 'supertrend' ? 0.1 : 1} value={draft.secondaryPeriod} onChange={(event) => setDraft({ ...draft, secondaryPeriod: Number(event.target.value) })} /><span>{draft.kind === 'rsi-reversion' ? '%' : draft.kind === 'supertrend' ? 'x' : '根'}</span></div>
       <label className="field-label" htmlFor="strategy-fee">单边交易成本</label><div className="input-shell"><input id="strategy-fee" type="number" min="0" max="100" step="0.1" value={draft.feeBps} onChange={(event) => setDraft({ ...draft, feeBps: Number(event.target.value) })} /><span>bps</span></div>
-      <div className="modal-actions">{strategies.some((strategy) => strategy.id === draft.id) && <button className="danger-button" onClick={removeDraft}><Trash2 size={15} />删除</button>}<button className="secondary-button" onClick={() => setDraft(null)}>取消</button><button className="primary-button" onClick={saveDraft}>保存策略</button></div>
+      <div className="modal-actions">{strategies.some((strategy) => strategy.id === draft.id) && !defaultStrategyIds.has(draft.id) && <button className="danger-button" onClick={removeDraft}><Trash2 size={15} />删除</button>}<button className="secondary-button" onClick={() => setDraft(null)}>取消</button><button className="primary-button" onClick={saveDraft}>保存策略</button></div>
     </div></Modal>}
   </main>
 }

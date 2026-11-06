@@ -6,20 +6,96 @@ const DEFAULT_MODEL_TIMEOUT = 60_000
 const DEFAULT_SUPERVISION_TIMEOUT = 12_000
 const AGENT_SKILLS = Object.freeze({
   'market-analysis': Object.freeze({
-    version: '1.0.0',
-    instructions: '只使用提供的已闭合 K 线和已授权市场工具评估趋势、波动率、成交量与关键价位。不得把未闭合走势、缺失数据或单一指标当作确定事实；证据不足时拒绝候选。',
+    version: '2.0.0',
+    name: '市场状态与波动率识别',
+    applicability: ['spot', 'futures'],
+    inputBoundary: {
+      required: ['agent.marketType/symbol/interval', 'signal', 'candidateOrder', 'recentCandles (closed only)', 'derived.regime'],
+      optional: ['authorized MCP market data with source timestamp'],
+      prohibited: ['unfinished candle', 'unstamped external quote', 'invented order-book depth'],
+    },
+    instructions: [
+      '目标：识别趋势、震荡、突破和异常波动状态，判断候选方向是否得到多项证据支持。',
+      '检查：结合 20 根收益、ATR%、区间位置、短窗实现波动率和成交量比；不得只凭单根 K 线或一个指标批准。',
+      '否决：趋势与信号相反；波动率或成交量异常且候选未体现风险收缩；闭合 K 线不足 20 根；关键输入互相矛盾。',
+      '边界：所有市场判断只能来自 skillInputs.market-analysis 或已授权 MCP 返回的带时间戳数据。',
+    ].join('\n'),
+    assistantInstructions: '使用当前上下文里的真实市场数据区分趋势、震荡、突破和异常波动；明确列出数据周期与缺失项，不得把模型记忆当成实时行情。',
   }),
   'risk-review': Object.freeze({
+    version: '2.0.0',
+    name: '仓位规模与风险预算',
+    applicability: ['spot', 'futures'],
+    inputBoundary: {
+      required: ['agent.risk', 'account equity/available balance/position', 'signal', 'candidateOrder', 'derived.riskBudget'],
+      optional: ['account unrealizedPnl/todayPnl'],
+      prohibited: ['unprovided stop price', 'assumed leverage', 'modified candidate quantity'],
+    },
+    instructions: [
+      '目标：独立审查候选名义价值、可用资金占用、组合方向集中度和 Agent 风险预算。',
+      '检查：候选方向必须与信号一致；名义价值不得超过 maxNotional；数量不得超过 maxQuantity；不得在可用余额不足或已有同向暴露过高时批准新增风险。',
+      '否决：任一风险输入缺失或非有限数；候选突破配置上限；保证金/余额不足；订单会意外扩大而不是降低现有风险。',
+      '边界：只能批准或拒绝冻结候选，不得重算、修改或建议修改任何订单字段。',
+    ].join('\n'),
+    assistantInstructions: '基于账户权益、可用余额、现有持仓和明确订单参数分析风险预算；没有数量、价格或止损时只说明缺失项，不得编造仓位建议。',
+  }),
+  'execution-quality': Object.freeze({
     version: '1.0.0',
-    instructions: '核对候选方向与策略信号是否一致，并评估账户可用余额、现有持仓、名义价值、波动和流动性风险。不得重新计算、修改或建议修改候选订单字段；发现冲突或数据不足时拒绝。',
+    name: '执行质量与滑点审查',
+    applicability: ['spot', 'futures'],
+    inputBoundary: {
+      required: ['candidateOrder type/price/marketPrice/quantity', 'recentCandles OHLCV', 'derived.execution'],
+      optional: ['authorized MCP bid/ask, depth and recent trades with timestamp'],
+      prohibited: ['assumed spread', 'invented fill price', 'unstamped liquidity data'],
+    },
+    instructions: [
+      '目标：在不改变订单的前提下审查价格新鲜度、粗略流动性、潜在滑点和市场冲击。',
+      '检查：比较候选名义价值与近 20 根平均报价成交额，检查最近 K 线振幅；限价单检查价格与 marketPrice 偏离，市价单在缺少盘口时只能使用成交额占比作保守代理。',
+      '否决：价格无效或陈旧；候选相对近期成交额过大；限价偏离异常；声称精确滑点但未获得授权盘口数据。',
+      '边界：K 线成交量不能冒充订单簿深度；没有 bid/ask 时必须明确滑点只是代理判断。',
+    ].join('\n'),
+    assistantInstructions: '分析价格新鲜度、成交额占比和限价偏离；没有盘口深度时必须把滑点判断标为粗略代理，不能给出伪精确成交价。',
+  }),
+  'futures-carry-risk': Object.freeze({
+    version: '1.0.0',
+    name: '资金费率与清算风险',
+    applicability: ['futures'],
+    inputBoundary: {
+      required: ['agent.marketType/positionMode', 'candidateOrder leverage/marginType/reduceOnly', 'account.position liquidationPrice/marginRatio when a position exists', 'derived.futuresRisk'],
+      optional: ['authorized MCP funding rate/next funding time/open interest with source timestamp'],
+      prohibited: ['invented funding rate', 'assumed liquidation price', 'spot carry claims'],
+    },
+    instructions: [
+      '目标：审查永续合约候选的杠杆、保证金模式、清算缓冲与资金费率方向性成本。',
+      '检查：区分开仓/加仓与 reduce-only 降险；核对 positionSide、positionMode、杠杆和清算距离；资金费率只有在授权工具返回带时间戳数据时才可量化。',
+      '否决：已有持仓的清算或保证金数据缺失且候选扩大风险；现有清算缓冲过窄且候选扩大风险；候选方向与持仓模式冲突；依赖未提供的资金费率结论。',
+      '边界：现货候选标记为不适用，不得因此否决；reduce-only 平仓优先视为降险，但仍需检查订单字段一致性。',
+    ].join('\n'),
+    assistantInstructions: '仅在合约上下文中分析杠杆、保证金、清算缓冲和资金成本；资金费率必须来自带时间戳的授权数据，现货场景明确标记不适用。',
   }),
   'news-research': Object.freeze({
-    version: '1.0.0',
+    version: '1.1.0',
+    name: '事件与新闻研究',
+    applicability: ['spot', 'futures'],
+    inputBoundary: {
+      required: ['authorized MCP result with source and timestamp'],
+      optional: ['multiple independent sources'],
+      prohibited: ['model memory presented as current news', 'unsourced sentiment'],
+    },
     instructions: '只有通过已授权 MCP 工具取得带来源和时间戳的事件信息时，才能把新闻作为辅助证据。不得编造新闻，不得把情绪当作事实；来源不可用、时间过旧或互相矛盾时拒绝依赖新闻的候选。',
+    assistantInstructions: '只有通过已授权 MCP 工具取得带来源和时间戳的信息时才能讨论当前事件；分开陈述事实、来源冲突和情绪推断。',
   }),
   'strategy-builder': Object.freeze({
-    version: '1.0.0',
+    version: '1.1.0',
+    name: '策略一致性审查',
+    applicability: ['spot', 'futures'],
+    inputBoundary: {
+      required: ['agent.strategy/params', 'signal', 'candidateOrder'],
+      optional: ['recentCandles used by the deterministic strategy'],
+      prohibited: ['new strategy rules', 'changed parameters', 'replacement order'],
+    },
     instructions: '审查确定性策略名称、参数、信号理由与候选订单是否逻辑一致。不得创建新策略、改变规则或替换候选订单；发现规则与信号不一致时拒绝。',
+    assistantInstructions: '把策略说明拆成可验证条件、参数、输入周期和失效条件；清楚区分现有规则与用户提出但尚未实现的规则。',
   }),
 })
 
@@ -33,8 +109,36 @@ export function resolveAgentSkills(skillIds = []) {
   return [...new Set(Array.isArray(skillIds) ? skillIds : [])].map((id) => {
     const skill = AGENT_SKILLS[id]
     if (!skill) throw new Error(`Agent 请求了未知 Skill：${id}`)
-    return { id, version: skill.version, instructions: skill.instructions }
+    return {
+      id,
+      version: skill.version,
+      name: skill.name,
+      applicability: [...skill.applicability],
+      inputBoundary: {
+        required: [...skill.inputBoundary.required],
+        optional: [...skill.inputBoundary.optional],
+        prohibited: [...skill.inputBoundary.prohibited],
+      },
+      instructions: skill.instructions,
+      assistantInstructions: skill.assistantInstructions,
+    }
   })
+}
+
+export function partitionAgentSkills(skillIds = [], marketType = 'spot') {
+  const selected = resolveAgentSkills(skillIds)
+  const applicable = selected.filter((skill) => skill.applicability.includes(marketType))
+  const skipped = selected
+    .filter((skill) => !skill.applicability.includes(marketType))
+    .map(({ id, version, name, applicability }) => ({
+      id,
+      version,
+      name,
+      applicability,
+      status: 'NOT_APPLICABLE',
+      reason: `${marketType} 市场不在 Skill 适用范围内`,
+    }))
+  return { applicable, skipped }
 }
 
 export function buildAgentSupervisorSystem(skillIds = []) {
@@ -43,7 +147,15 @@ export function buildAgentSupervisorSystem(skillIds = []) {
     '你是 Atlas Agent OS 的交易候选监督器。你只能批准或拒绝已经由确定性策略生成的候选订单。',
     '你绝对不能修改或建议修改 side、quantity、price、symbol、environment、marketType、positionSide、reduceOnly 或任何订单字段，也不能提交订单。',
     '硬风控在你批准后仍会再次执行；你的批准不代表订单一定成交。任何数据不足、工具失败或不确定性都必须选择 REJECT。',
-    ...skills.map((skill) => `[受信任 Skill ${skill.id}@${skill.version}]\n${skill.instructions}`),
+    ...skills.map((skill) => [
+      `[受信任 Skill ${skill.id}@${skill.version}] ${skill.name}`,
+      `适用市场：${skill.applicability.join(', ')}`,
+      `必需输入：${skill.inputBoundary.required.join('；')}`,
+      `可选输入：${skill.inputBoundary.optional.join('；')}`,
+      `禁止输入：${skill.inputBoundary.prohibited.join('；')}`,
+      skill.instructions,
+    ].join('\n')),
+    skills.length ? `必须逐项执行全部已选 Skill；任一 Skill 否决则最终 REJECT。reason 按 ${skills.map((skill) => skill.id).join('、')} 的顺序给出 PASS/FAIL 与关键依据。` : '没有选择 Skill 时，只能按基础一致性和数据完整性规则裁决。',
     '只返回一个 JSON 对象，且只能包含 decision、confidence、reason 三个字段。decision 只能是 APPROVE 或 REJECT，confidence 必须是 0 到 1 的数字。不要输出 Markdown 或额外文字。',
   ].join('\n')
 }
@@ -79,12 +191,14 @@ function modelConnectionError(config, error) {
   return new Error(`${config.provider || '模型'} · ${config.model} 请求失败：${message}`)
 }
 
-function buildContext(payload, toolMappings) {
-  const enabledSkills = (payload.skills || []).join('、') || '市场分析、风险审查'
+export function buildAssistantSystem(payload, toolMappings) {
+  const trustedSkills = resolveAgentSkills(payload.skills || [])
+  const enabledSkills = trustedSkills.map((skill) => `${skill.name} (${skill.id}@${skill.version})`).join('、') || '未启用'
   return [
     '你是 Atlas 交易工作台中的分析助手。回答必须区分事实、推断和风险，不承诺收益。',
     '你可以分析行情和账户上下文，但不能绕过风控，也不能主动提交生产订单。',
     `已启用 Skill：${enabledSkills}。`,
+    ...trustedSkills.map((skill) => `[受信任 Skill ${skill.id}@${skill.version}]\n输入边界：${skill.inputBoundary.required.join('；')}\n${skill.assistantInstructions}`),
     toolMappings.length ? `可调用 MCP 工具：${toolMappings.map((tool) => tool.originalName).join('、')}。仅在回答确实需要时调用。` : '',
     payload.context ? `当前上下文：${JSON.stringify(payload.context)}` : '',
   ].filter(Boolean).join('\n')
@@ -324,7 +438,7 @@ async function chatGoogle(config, payload, mappings, system) {
   }
 }
 
-async function chatWithConfig(config, payload, system = buildContext(payload, toolMappings(payload))) {
+async function chatWithConfig(config, payload, system = buildAssistantSystem(payload, toolMappings(payload))) {
   const mappings = toolMappings(payload)
   try {
     if (config.protocol === 'responses') return await chatResponses(config, payload, mappings, system)
@@ -366,6 +480,171 @@ function parseSupervisionDecision(content) {
   return { decision, confidence, reason: reason.slice(0, 1000) }
 }
 
+function finiteMetric(value) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function roundedMetric(value, digits = 6) {
+  return Number.isFinite(value) ? Number(value.toFixed(digits)) : null
+}
+
+function average(values) {
+  const finite = values.filter(Number.isFinite)
+  return finite.length ? finite.reduce((sum, value) => sum + value, 0) / finite.length : null
+}
+
+function deriveRegime(candles) {
+  const recent = candles.slice(-20)
+  const closes = recent.map((candle) => finiteMetric(candle.close)).filter(Number.isFinite)
+  const returns = closes.slice(1).map((close, index) => closes[index] > 0 ? close / closes[index] - 1 : NaN).filter(Number.isFinite)
+  const meanReturn = average(returns)
+  const variance = meanReturn === null ? null : average(returns.map((value) => (value - meanReturn) ** 2))
+  const latest = recent.at(-1)
+  const latestClose = finiteMetric(latest?.close)
+  const trueRanges = recent.map((candle, index) => {
+    const high = finiteMetric(candle.high)
+    const low = finiteMetric(candle.low)
+    const previousClose = finiteMetric(recent[index - 1]?.close)
+    if (high === null || low === null) return NaN
+    return previousClose === null ? high - low : Math.max(high - low, Math.abs(high - previousClose), Math.abs(low - previousClose))
+  })
+  const atr = average(trueRanges)
+  const highs = recent.map((candle) => finiteMetric(candle.high)).filter(Number.isFinite)
+  const lows = recent.map((candle) => finiteMetric(candle.low)).filter(Number.isFinite)
+  const rangeHigh = highs.length ? Math.max(...highs) : null
+  const rangeLow = lows.length ? Math.min(...lows) : null
+  const volumes = recent.map((candle) => finiteMetric(candle.volume)).filter(Number.isFinite)
+  const baselineVolume = average(volumes.slice(0, -1))
+  return {
+    closedCandleCount: candles.length,
+    return20Pct: closes.length >= 2 ? roundedMetric((closes.at(-1) / closes[0] - 1) * 100) : null,
+    atr20Pct: latestClose && atr !== null ? roundedMetric(atr / latestClose * 100) : null,
+    realizedVolatility20Pct: variance !== null ? roundedMetric(Math.sqrt(variance) * 100) : null,
+    rangePosition20: latestClose !== null && rangeHigh !== null && rangeLow !== null && rangeHigh > rangeLow ? roundedMetric((latestClose - rangeLow) / (rangeHigh - rangeLow)) : null,
+    latestVolumeRatio20: baselineVolume && volumes.length ? roundedMetric(volumes.at(-1) / baselineVolume) : null,
+  }
+}
+
+function deriveRiskBudget(request) {
+  const order = request.candidateOrder || {}
+  const account = request.account || {}
+  const risk = request.agent?.risk || {}
+  const quantity = finiteMetric(order.quantity)
+  const price = finiteMetric(order.marketPrice ?? order.price)
+  const candidateNotional = quantity !== null && price !== null ? Math.abs(quantity * price) : null
+  const equity = finiteMetric(account.totalWalletBalance)
+  const available = finiteMetric(account.availableBalance)
+  const maxNotional = finiteMetric(risk.maxNotional)
+  const maxQuantity = finiteMetric(risk.maxQuantity)
+  const riskFraction = finiteMetric(risk.riskFraction)
+  return {
+    candidateNotional: roundedMetric(candidateNotional),
+    configuredRiskBudget: equity !== null && riskFraction !== null ? roundedMetric(equity * riskFraction) : null,
+    notionalLimitUsage: candidateNotional !== null && maxNotional && maxNotional > 0 ? roundedMetric(candidateNotional / maxNotional) : null,
+    quantityLimitUsage: quantity !== null && maxQuantity && maxQuantity > 0 ? roundedMetric(Math.abs(quantity) / maxQuantity) : null,
+    availableBalanceUsage: candidateNotional !== null && available && available > 0 ? roundedMetric(candidateNotional / available) : null,
+  }
+}
+
+function deriveExecution(request, candles) {
+  const order = request.candidateOrder || {}
+  const riskBudget = deriveRiskBudget(request)
+  const recent = candles.slice(-20)
+  const quoteTurnovers = recent.map((candle) => {
+    const close = finiteMetric(candle.close)
+    const volume = finiteMetric(candle.volume)
+    return close !== null && volume !== null ? Math.abs(close * volume) : NaN
+  })
+  const averageQuoteTurnover = average(quoteTurnovers)
+  const latest = recent.at(-1)
+  const latestHigh = finiteMetric(latest?.high)
+  const latestLow = finiteMetric(latest?.low)
+  const latestClose = finiteMetric(latest?.close)
+  const orderPrice = finiteMetric(order.price)
+  const marketPrice = finiteMetric(order.marketPrice)
+  return {
+    candidateNotional: riskBudget.candidateNotional,
+    candidateToAverageCandleTurnover: riskBudget.candidateNotional !== null && averageQuoteTurnover && averageQuoteTurnover > 0 ? roundedMetric(riskBudget.candidateNotional / averageQuoteTurnover) : null,
+    latestCandleRangePct: latestClose && latestHigh !== null && latestLow !== null ? roundedMetric((latestHigh - latestLow) / latestClose * 100) : null,
+    limitDeviationPct: order.type === 'LIMIT' && orderPrice !== null && marketPrice ? roundedMetric((orderPrice / marketPrice - 1) * 100) : null,
+    exactSpreadAvailable: false,
+    orderBookDepthAvailable: false,
+  }
+}
+
+function deriveFuturesRisk(request) {
+  const position = request.account?.position || null
+  const futuresConfig = request.account?.futuresConfig || null
+  const markPrice = finiteMetric(position?.markPrice)
+  const liquidationPrice = finiteMetric(position?.liquidationPrice)
+  let liquidationBufferPct = null
+  if (markPrice && liquidationPrice && markPrice > 0 && liquidationPrice > 0) {
+    liquidationBufferPct = position?.side === 'SHORT'
+      ? (liquidationPrice - markPrice) / markPrice * 100
+      : (markPrice - liquidationPrice) / markPrice * 100
+  }
+  return {
+    applicable: request.agent?.marketType === 'futures',
+    leverage: finiteMetric(request.candidateOrder?.leverage ?? futuresConfig?.leverage ?? position?.leverage),
+    marginType: request.candidateOrder?.marginType || futuresConfig?.marginType || position?.marginType || null,
+    positionMode: futuresConfig?.positionMode || request.agent?.positionMode || null,
+    reduceOnly: request.candidateOrder?.reduceOnly === true,
+    liquidationBufferPct: roundedMetric(liquidationBufferPct),
+    marginRatio: finiteMetric(position?.marginRatio),
+    fundingRate: null,
+    fundingRateAvailable: false,
+    fundingPnlToday: finiteMetric(request.account?.fundingPnlToday),
+  }
+}
+
+export function buildAgentSupervisionContext(request, connectedServers = [], resolvedSkills, skippedSkills = []) {
+  const partitioned = resolvedSkills
+    ? { applicable: resolvedSkills, skipped: skippedSkills }
+    : partitionAgentSkills(request?.intelligence?.skills || [], request?.agent?.marketType)
+  const skills = partitioned.applicable
+  const recentCandles = (Array.isArray(request?.candles) ? request.candles : []).slice(-100).map((candle) => ({
+    time: candle.time,
+    open: candle.open,
+    high: candle.high,
+    low: candle.low,
+    close: candle.close,
+    volume: candle.volume,
+  }))
+  const availableMcpTools = connectedServers.map((server) => ({
+    server: server.url,
+    tools: (server.tools || []).map((tool) => ({ name: tool.name, description: tool.description || '', inputSchema: tool.inputSchema || null })),
+  }))
+  const skillInputs = {}
+  for (const skill of skills) {
+    if (skill.id === 'market-analysis') {
+      skillInputs[skill.id] = { market: { marketType: request.agent.marketType, symbol: request.agent.symbol, interval: request.agent.interval }, signal: request.signal, candidateOrder: request.candidateOrder, recentCandles, derived: { regime: deriveRegime(recentCandles) } }
+    } else if (skill.id === 'risk-review') {
+      skillInputs[skill.id] = { configuredRisk: request.agent.risk, account: request.account, signal: request.signal, candidateOrder: request.candidateOrder, derived: { riskBudget: deriveRiskBudget(request) } }
+    } else if (skill.id === 'execution-quality') {
+      skillInputs[skill.id] = { candidateOrder: request.candidateOrder, recentCandles, authorizedLiquidityTools: availableMcpTools, derived: { execution: deriveExecution(request, recentCandles) } }
+    } else if (skill.id === 'futures-carry-risk') {
+      skillInputs[skill.id] = { market: { marketType: request.agent.marketType, symbol: request.agent.symbol, positionMode: request.agent.positionMode }, candidateOrder: request.candidateOrder, position: request.account?.position || null, authorizedCarryTools: availableMcpTools, derived: { futuresRisk: deriveFuturesRisk(request) } }
+    } else if (skill.id === 'news-research') {
+      skillInputs[skill.id] = { candidateOrder: request.candidateOrder, signal: request.signal, authorizedResearchTools: availableMcpTools }
+    } else if (skill.id === 'strategy-builder') {
+      skillInputs[skill.id] = { strategy: request.agent.strategy, params: request.agent.params, signal: request.signal, candidateOrder: request.candidateOrder, recentCandles }
+    }
+  }
+  return {
+    agent: request.agent,
+    candidateOrder: request.candidateOrder,
+    signal: request.signal,
+    candleTime: request.candleTime,
+    recentCandles,
+    account: request.account,
+    selectedSkills: skills.map(({ id, version, name, applicability, inputBoundary }) => ({ id, version, name, applicability, inputBoundary })),
+    skippedSkills: partitioned.skipped,
+    skillInputs,
+    availableMcpTools,
+  }
+}
+
 export async function chatWithModel(payload) {
   const config = await configuredModel(payload?.model)
   return chatWithConfig(config, payload)
@@ -377,7 +656,7 @@ export async function superviseAgentCandidate(request) {
   }
   const timeoutMs = boundedTimeout(request.timeoutMs, DEFAULT_SUPERVISION_TIMEOUT)
   const config = await configuredModel(request.intelligence.model)
-  const trustedSkills = resolveAgentSkills(request.intelligence.skills || [])
+  const { applicable: trustedSkills, skipped: skippedSkills } = partitionAgentSkills(request.intelligence.skills || [], request.agent.marketType)
   const selectedServers = (request.intelligence.mcpServers || []).slice(0, 8)
   const discoveredServers = await Promise.all(selectedServers.map(async (url) => {
     const connection = await connectMcp({ url, timeoutMs: Math.min(timeoutMs, 8_000) })
@@ -385,28 +664,21 @@ export async function superviseAgentCandidate(request) {
   }))
   const connectedServers = authorizeAgentMcpTools(discoveredServers, request.intelligence.mcpTools || [])
   const system = buildAgentSupervisorSystem(trustedSkills.map((skill) => skill.id))
-  const context = {
-    agent: request.agent,
-    candidateOrder: request.candidateOrder,
-    signal: request.signal,
-    candleTime: request.candleTime,
-    recentCandles: request.candles,
-    account: request.account,
-    selectedSkills: trustedSkills.map(({ id, version }) => ({ id, version })),
-    availableMcpTools: connectedServers.map((server) => ({
-      server: server.url,
-      tools: server.tools.map((tool) => ({ name: tool.name, description: tool.description || '', inputSchema: tool.inputSchema || null })),
-    })),
-  }
+  const context = buildAgentSupervisionContext(request, connectedServers, trustedSkills, skippedSkills)
   const response = await chatWithConfig(config, {
     messages: [{ role: 'user', content: `请审查以下冻结的交易候选，并按指定 JSON 格式裁决：\n${JSON.stringify(context)}` }],
-    skills: request.intelligence.skills || [],
+    skills: trustedSkills.map((skill) => skill.id),
     mcpServers: connectedServers,
     timeoutMs,
   }, system)
+  const decision = parseSupervisionDecision(response.content)
   return {
-    ...parseSupervisionDecision(response.content),
+    ...decision,
     model: response.model || config.model,
     usage: response.usage || null,
+    skillAudit: {
+      applicable: trustedSkills.map(({ id, version }) => ({ id, version, status: 'APPLICABLE' })),
+      skipped: skippedSkills,
+    },
   }
 }

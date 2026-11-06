@@ -1353,6 +1353,16 @@ kbd {
 .agent-create-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .agent-create-fields > div { min-width: 0; }
 .agent-create-fields .field-label { min-height: 14px; margin-top: 0; }
+.agent-strategy-config { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
+.agent-strategy-config > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.agent-strategy-config > header strong { color: var(--secondary); font-size: 10px; font-weight: 500; }
+.agent-strategy-config > header span { color: var(--muted); font-size: 9px; }
+.agent-strategy-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 8px; }
+.agent-strategy-fields > div { min-width: 0; }
+.agent-strategy-fields .field-label { min-height: 14px; margin-top: 0; }
+.agent-strategy-fields .input-shell { min-height: 40px; }
+.agent-strategy-fields input[type='number'] { appearance: textfield; }
+.agent-strategy-fields input[type='number']::-webkit-inner-spin-button { display: none; }
 .agent-mode-options { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .agent-mode-options > button { min-height: 56px; display: grid; grid-template-columns: 20px minmax(0, 1fr); align-items: center; gap: 8px; padding: 8px 12px; color: var(--muted); background: #111213; border: 1px solid var(--border); border-radius: 7px; cursor: pointer; text-align: left; }
 .agent-mode-options > button:hover { color: var(--secondary); border-color: var(--border-strong); }
@@ -1937,7 +1947,7 @@ kbd {
   .agent-create-grid { grid-template-columns: 1fr; }
   .agent-create-aside { display: none; }
   .agent-create-fields { grid-template-columns: 1fr; }
-  .agent-mode-options, .agent-capability-list, .agent-ai-controls { grid-template-columns: 1fr; }
+  .agent-mode-options, .agent-capability-list, .agent-ai-controls, .agent-strategy-fields { grid-template-columns: 1fr; }
   .builder-aside { display: none; }
   .tool-grid { grid-template-columns: 1fr; }
   .assistant-layout { min-height: auto; }

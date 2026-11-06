@@ -144,10 +144,9 @@ export function AssistantView({ environment, marketType, symbol, tick, account, 
       if (!window.atlas) throw new Error('AI 对话需要在 Atlas 桌面应用中运行')
       const withUserMessage = await window.atlas.ai.sessions.append(sessionId, { role: 'user', content: trimmed })
       setSessionState(withUserMessage)
-      const skillNames = enabledSkills.map((id) => builtInSkills.find((skill) => skill.id === id)?.name || id)
       const response = await window.atlas.ai.chat({
         messages: withUserMessage.activeSession.messages.map(({ role, content: messageContent }) => ({ role, content: messageContent })),
-        skills: skillNames,
+        skills: enabledSkills,
         mcp: mcpConnection || undefined,
         context: {
           environment,
