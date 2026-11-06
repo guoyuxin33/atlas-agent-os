@@ -2,6 +2,7 @@ import { createHmac, randomUUID } from 'node:crypto'
 import { app } from 'electron'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { exchangeInfoCatalog } from './exchange-info.mjs'
 import { loadVault } from './vault.mjs'
 import { fetchWithProxy } from './network.mjs'
 
@@ -122,6 +123,165 @@ function assertOrder(order) {
   if (order.clientOrderId && !/^[A-Za-z0-9_-]{1,36}$/.test(order.clientOrderId)) throw new Error('Invalid client order id')
 }
 
+function expandDecimal(value) {
+  const input = String(value ?? '').trim()
+  const match = input.match(/^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/)
+  if (!match || (!match[2] && !match[3])) throw new Error(`无效数值 ${input || '(empty)'}`)
+  const sign = match[1] === '-' ? '-' : ''
+  const whole = match[2] || ''
+  const fraction = match[3] || ''
+  const exponent = Number(match[4] || 0)
+  const digits = `${whole}${fraction}` || '0'
+  const decimalIndex = whole.length + exponent
+  let expanded
+  if (decimalIndex <= 0) expanded = `0.${'0'.repeat(-decimalIndex)}${digits}`
+  else if (decimalIndex >= digits.length) expanded = `${digits}${'0'.repeat(decimalIndex - digits.length)}`
+  else expanded = `${digits.slice(0, decimalIndex)}.${digits.slice(decimalIndex)}`
+  const [integerPart, decimalPart = ''] = expanded.split('.')
+  const integer = integerPart.replace(/^0+(?=\d)/, '') || '0'
+  const decimal = decimalPart.replace(/0+$/, '')
+  const normalized = decimal ? `${integer}.${decimal}` : integer
+  return normalized === '0' ? '0' : `${sign}${normalized}`
+}
+
+function decimalScale(value) {
+  const normalized = expandDecimal(value)
+  return normalized.includes('.') ? normalized.length - normalized.indexOf('.') - 1 : 0
+}
+
+function decimalUnits(value, scale) {
+  const normalized = expandDecimal(value)
+  const negative = normalized.startsWith('-')
+  const unsigned = negative ? normalized.slice(1) : normalized
+  const [integer, fraction = ''] = unsigned.split('.')
+  const units = BigInt(`${integer}${fraction.padEnd(scale, '0')}`)
+  return negative ? -units : units
+}
+
+function decimalFromUnits(units, scale) {
+  const negative = units < 0n
+  const digits = (negative ? -units : units).toString().padStart(scale + 1, '0')
+  const raw = scale ? `${digits.slice(0, -scale)}.${digits.slice(-scale)}` : digits
+  const normalized = expandDecimal(raw)
+  return negative && normalized !== '0' ? `-${normalized}` : normalized
+}
+
+function compareDecimals(left, right) {
+  const scale = Math.max(decimalScale(left), decimalScale(right))
+  const leftUnits = decimalUnits(left, scale)
+  const rightUnits = decimalUnits(right, scale)
+  return leftUnits === rightUnits ? 0 : leftUnits > rightUnits ? 1 : -1
+}
+
+function gcd(left, right) {
+  let a = left < 0n ? -left : left
+  let b = right < 0n ? -right : right
+  while (b) [a, b] = [b, a % b]
+  return a
+}
+
+function combinedStep(values) {
+  const active = values.filter((value) => value !== undefined && compareDecimals(value, '0') > 0)
+  if (!active.length) return null
+  const scale = Math.max(...active.map(decimalScale))
+  const units = active.map((value) => decimalUnits(value, scale))
+  const step = units.reduce((current, value) => current / gcd(current, value) * value)
+  return decimalFromUnits(step, scale)
+}
+
+function clampToStep(value, step, direction = 'down') {
+  if (!step || compareDecimals(step, '0') <= 0) return expandDecimal(value)
+  const scale = Math.max(decimalScale(value), decimalScale(step))
+  const valueUnits = decimalUnits(value, scale)
+  const stepUnits = decimalUnits(step, scale)
+  const quotient = valueUnits / stepUnits
+  const remainder = valueUnits % stepUnits
+  const normalizedUnits = direction === 'up' && remainder ? (quotient + 1n) * stepUnits : quotient * stepUnits
+  return decimalFromUnits(normalizedUnits, scale)
+}
+
+function minimumPositive(values) {
+  return values.filter((value) => value !== undefined && compareDecimals(value, '0') > 0)
+    .reduce((minimum, value) => minimum === null || compareDecimals(value, minimum) < 0 ? expandDecimal(value) : minimum, null)
+}
+
+function maximumPositive(values) {
+  return values.filter((value) => value !== undefined && compareDecimals(value, '0') > 0)
+    .reduce((maximum, value) => maximum === null || compareDecimals(value, maximum) > 0 ? expandDecimal(value) : maximum, null)
+}
+
+function decimalProduct(left, right) {
+  const leftScale = decimalScale(left)
+  const rightScale = decimalScale(right)
+  return { units: decimalUnits(left, leftScale) * decimalUnits(right, rightScale), scale: leftScale + rightScale }
+}
+
+function compareProductToDecimal(product, value) {
+  const scale = Math.max(product.scale, decimalScale(value))
+  const productUnits = product.units * (10n ** BigInt(scale - product.scale))
+  const valueUnits = decimalUnits(value, scale)
+  return productUnits === valueUnits ? 0 : productUnits > valueUnits ? 1 : -1
+}
+
+function filterByType(rules, type) {
+  return (Array.isArray(rules?.filters) ? rules.filters : []).find((filter) => filter.filterType === type)
+}
+
+function activeNotionalLimits(order, rules) {
+  const minNotional = filterByType(rules, 'MIN_NOTIONAL')
+  const notional = filterByType(rules, 'NOTIONAL')
+  const market = order.type === 'MARKET'
+  const minimums = []
+  const maximums = []
+  if (minNotional && (!market || minNotional.applyToMarket !== false)) minimums.push(minNotional.minNotional ?? minNotional.notional)
+  if (notional && (!market || notional.applyMinToMarket !== false)) minimums.push(notional.minNotional)
+  if (notional && (!market || notional.applyMaxToMarket !== false)) maximums.push(notional.maxNotional)
+  return { minimum: maximumPositive(minimums), maximum: minimumPositive(maximums) }
+}
+
+export function normalizeBinanceOrder(order, rules) {
+  const lotSize = filterByType(rules, 'LOT_SIZE')
+  const marketLotSize = order.type === 'MARKET' ? filterByType(rules, 'MARKET_LOT_SIZE') : null
+  const lotFilters = [lotSize, marketLotSize].filter(Boolean)
+  const quantityStep = combinedStep(lotFilters.map((filter) => filter.stepSize))
+  const minimumQuantity = maximumPositive(lotFilters.map((filter) => filter.minQty))
+  const maximumQuantity = minimumPositive(lotFilters.map((filter) => filter.maxQty))
+  const requestedQuantity = expandDecimal(order.quantity)
+  const quantity = clampToStep(requestedQuantity, quantityStep, 'down')
+  if (compareDecimals(quantity, '0') <= 0) throw new Error(`${order.symbol} 数量低于 Binance 最小步长 ${quantityStep || minimumQuantity || 'unknown'}`)
+  if (minimumQuantity && compareDecimals(quantity, minimumQuantity) < 0) throw new Error(`${order.symbol} 数量 ${quantity} 低于最小数量 ${minimumQuantity}`)
+  if (maximumQuantity && compareDecimals(requestedQuantity, maximumQuantity) > 0) throw new Error(`${order.symbol} 数量 ${requestedQuantity} 超过单笔最大数量 ${maximumQuantity}`)
+
+  let price = order.price
+  if (order.type === 'LIMIT') {
+    const priceFilter = filterByType(rules, 'PRICE_FILTER')
+    const tickSize = priceFilter?.tickSize && compareDecimals(priceFilter.tickSize, '0') > 0 ? priceFilter.tickSize : null
+    price = clampToStep(order.price, tickSize, order.side === 'SELL' ? 'up' : 'down')
+    if (priceFilter?.minPrice && compareDecimals(priceFilter.minPrice, '0') > 0 && compareDecimals(price, priceFilter.minPrice) < 0) {
+      throw new Error(`${order.symbol} 限价 ${price} 低于最小价格 ${expandDecimal(priceFilter.minPrice)}`)
+    }
+    if (priceFilter?.maxPrice && compareDecimals(priceFilter.maxPrice, '0') > 0 && compareDecimals(price, priceFilter.maxPrice) > 0) {
+      throw new Error(`${order.symbol} 限价 ${price} 超过最大价格 ${expandDecimal(priceFilter.maxPrice)}`)
+    }
+  }
+
+  const notionalLimits = activeNotionalLimits(order, rules)
+  const validationPrice = order.type === 'LIMIT' ? price : order.marketPrice
+  if ((notionalLimits.minimum || notionalLimits.maximum) && !(Number(validationPrice) > 0)) {
+    throw new Error(`${order.symbol} 缺少有效市场价格，无法校验 Binance 名义价值规则`)
+  }
+  if (validationPrice) {
+    const product = decimalProduct(quantity, validationPrice)
+    if (notionalLimits.minimum && compareProductToDecimal(product, notionalLimits.minimum) < 0) {
+      throw new Error(`${order.symbol} 订单名义价值低于最小值 ${expandDecimal(notionalLimits.minimum)}`)
+    }
+    if (notionalLimits.maximum && compareProductToDecimal(product, notionalLimits.maximum) > 0) {
+      throw new Error(`${order.symbol} 订单名义价值超过最大值 ${expandDecimal(notionalLimits.maximum)}`)
+    }
+  }
+  return { ...order, quantity, price: order.type === 'LIMIT' ? price : undefined }
+}
+
 async function getLiveTickers(marketType = 'spot') {
   const normalizedMarketType = marketType === 'futures' ? 'futures' : 'spot'
   const tickerCache = tickerCaches[normalizedMarketType]
@@ -134,6 +294,14 @@ async function getLiveTickers(marketType = 'spot') {
   if (!response.ok || !Array.isArray(rows)) throw new Error(rows?.msg || 'Binance ticker request failed')
   tickerCaches[normalizedMarketType] = { expiresAt: Date.now() + 1000, rows }
   return rows
+}
+
+async function getOrderValidationPrice(environment, marketType, symbol) {
+  const path = marketType === 'futures' ? '/fapi/v1/ticker/price' : '/api/v3/ticker/price'
+  const ticker = await request({ environment, marketType, path, params: { symbol } })
+  const price = ticker?.price
+  if (!(Number(price) > 0)) throw new Error(`${symbol} 无法获取有效市场价格`)
+  return String(price)
 }
 
 function finiteNumber(value, fallback = 0) {
@@ -690,8 +858,12 @@ export async function getAccountSnapshot(options) {
   }
 
   const account = await request({ environment, marketType, path: '/api/v3/account', signed: true })
-  const balances = account.balances.filter((balance) => Number(balance.free) !== 0 || Number(balance.locked) !== 0)
   const tickers = await getLiveTickers('spot')
+  return buildBinanceSpotSnapshot({ account, tickers, environment })
+}
+
+export function buildBinanceSpotSnapshot({ account, tickers, environment = 'live', now = Date.now() }) {
+  const balances = (account.balances || []).filter((balance) => Number(balance.free) !== 0 || Number(balance.locked) !== 0)
   const tickerBySymbol = new Map(tickers.map((ticker) => [ticker.symbol, ticker]))
   let totalWalletBalance = 0
   let todayPnl = 0
@@ -714,6 +886,8 @@ export async function getAccountSnapshot(options) {
       marketType: 'spot',
       side: 'LONG',
       quantity: String(quantity),
+      availableQuantity: String(Number(balance.free) || 0),
+      lockedQuantity: String(Number(balance.locked) || 0),
       entryPrice: '',
       markPrice: ticker.lastPrice,
       marketValue: String(value),
@@ -727,7 +901,7 @@ export async function getAccountSnapshot(options) {
   return {
     source: 'binance',
     environment,
-    marketType,
+    marketType: 'spot',
     balances,
     positions: [],
     portfolio,
@@ -735,7 +909,7 @@ export async function getAccountSnapshot(options) {
     availableBalance: Number(account.balances.find((balance) => balance.asset === 'USDT')?.free || 0),
     unrealizedPnl: 0,
     todayPnl,
-    updatedAt: Date.now(),
+    updatedAt: now,
   }
 }
 
@@ -937,6 +1111,24 @@ export async function getOrders(options) {
   }))
 }
 
+export async function prepareBinanceOrder(order) {
+  assertOrder(order)
+  if (order.environment === 'paper') return { ...order }
+  const environment = order.environment === 'live' ? 'live' : 'testnet'
+  const marketType = order.marketType === 'futures' ? 'futures' : 'spot'
+  const rules = await exchangeInfoCatalog.symbolRules({
+    baseUrl: apiBase(environment, marketType),
+    marketType,
+    symbol: order.symbol,
+  })
+  const notionalLimits = activeNotionalLimits(order, rules)
+  const needsMarketPrice = order.type === 'MARKET' && (notionalLimits.minimum || notionalLimits.maximum) && !(Number(order.marketPrice) > 0)
+  const marketPrice = needsMarketPrice
+    ? await getOrderValidationPrice(environment, marketType, order.symbol)
+    : order.marketPrice
+  return normalizeBinanceOrder({ ...order, marketPrice }, rules)
+}
+
 export async function placeOrder(order) {
   assertOrder(order)
   if (order.environment === 'paper') {
@@ -971,27 +1163,28 @@ export async function placeOrder(order) {
   if (environment === 'live' && order.confirmation !== 'LIVE_ORDER_CONFIRMED') {
     throw new Error('生产订单缺少二次确认')
   }
-  const marketType = order.marketType === 'futures' ? 'futures' : 'spot'
+  const preparedOrder = await prepareBinanceOrder(order)
+  const marketType = preparedOrder.marketType === 'futures' ? 'futures' : 'spot'
   let positionMode
   let positionSide
   if (marketType === 'futures') {
     positionMode = await getBinancePositionMode(environment)
-    positionSide = normalizePositionSide(order.positionSide)
+    positionSide = normalizePositionSide(preparedOrder.positionSide)
     if (positionMode === 'HEDGE' && !['LONG', 'SHORT'].includes(positionSide)) throw new Error('双向持仓模式下单时必须选择 LONG 或 SHORT')
-    if (positionMode === 'HEDGE' && order.reduceOnly) throw new Error('双向持仓模式不能发送 reduceOnly，请用 positionSide 和相反方向平仓')
+    if (positionMode === 'HEDGE' && preparedOrder.reduceOnly) throw new Error('双向持仓模式不能发送 reduceOnly，请用 positionSide 和相反方向平仓')
     if (positionMode === 'ONE_WAY' && positionSide !== 'BOTH') throw new Error('单向持仓模式只能使用 BOTH positionSide')
   }
   const path = marketType === 'futures' ? '/fapi/v1/order' : '/api/v3/order'
   const params = {
-    symbol: order.symbol,
-    side: order.side,
-    type: order.type,
-    quantity: order.quantity,
-    price: order.type === 'LIMIT' ? order.price : undefined,
-    timeInForce: order.type === 'LIMIT' ? 'GTC' : undefined,
+    symbol: preparedOrder.symbol,
+    side: preparedOrder.side,
+    type: preparedOrder.type,
+    quantity: preparedOrder.quantity,
+    price: preparedOrder.type === 'LIMIT' ? preparedOrder.price : undefined,
+    timeInForce: preparedOrder.type === 'LIMIT' ? 'GTC' : undefined,
     positionSide: marketType === 'futures' && positionMode === 'HEDGE' ? positionSide : undefined,
-    reduceOnly: marketType === 'futures' && order.reduceOnly ? 'true' : undefined,
-    newClientOrderId: order.clientOrderId,
+    reduceOnly: marketType === 'futures' && preparedOrder.reduceOnly ? 'true' : undefined,
+    newClientOrderId: preparedOrder.clientOrderId,
     newOrderRespType: marketType === 'futures' ? 'RESULT' : 'FULL',
   }
   return request({ environment, marketType, path, method: 'POST', params, signed: true })

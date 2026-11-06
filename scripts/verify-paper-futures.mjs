@@ -96,15 +96,66 @@ try {
   process.stderr.write('QA Electron ready\n')
   const {
     adjustFuturesPositionMargin,
+    buildBinanceSpotSnapshot,
     getAccountSnapshot,
     getFuturesConfiguration,
     getFuturesPositionMode,
+    normalizeBinanceOrder,
     placeOrder,
     setFuturesLeverage,
     setFuturesMarginType,
     setFuturesPositionMode,
   } = await import('../electron/services/binance.mjs')
+  const { ExchangeInfoCatalog } = await import('../electron/services/exchange-info.mjs')
   const { AgentRuntime } = await import('../electron/services/agent-runtime.mjs')
+
+  await verify('Binance 规则缓存、精度规整与现货可用数量', async () => {
+    const exchangeInfo = {
+      symbols: [{
+        symbol: 'BTCUSDT', baseAsset: 'BTC', quoteAsset: 'USDT', status: 'TRADING',
+        filters: [
+          { filterType: 'LOT_SIZE', minQty: '0.00100000', maxQty: '100.00000000', stepSize: '0.00100000' },
+          { filterType: 'MARKET_LOT_SIZE', minQty: '0.01000000', maxQty: '10.00000000', stepSize: '0.01000000' },
+          { filterType: 'PRICE_FILTER', minPrice: '0.10000000', maxPrice: '100000.00000000', tickSize: '0.10000000' },
+          { filterType: 'MIN_NOTIONAL', minNotional: '5.00000000', applyToMarket: true },
+        ],
+      }],
+    }
+    let requests = 0
+    const catalog = new ExchangeInfoCatalog({ fetcher: async () => {
+      requests += 1
+      return { ok: true, json: async () => exchangeInfo }
+    } })
+    const [markets, rules] = await Promise.all([
+      catalog.markets({ marketType: 'spot', baseUrl: 'https://mock.binance' }),
+      catalog.symbolRules({ marketType: 'spot', baseUrl: 'https://mock.binance', symbol: 'BTCUSDT' }),
+    ])
+    assert(requests === 1 && markets[0]?.symbol === 'BTCUSDT', 'exchangeInfo 并发请求没有复用缓存')
+
+    const marketOrder = normalizeBinanceOrder(paperOrder({ symbol: 'BTCUSDT', quantity: '1.2399', marketPrice: '10' }), rules)
+    assert(marketOrder.quantity === '1.23', `市价数量未按 MARKET_LOT_SIZE 规整: ${marketOrder.quantity}`)
+    const sellLimit = normalizeBinanceOrder(paperOrder({ symbol: 'BTCUSDT', side: 'SELL', type: 'LIMIT', quantity: '1.2349', price: '10.01' }), rules)
+    assert(sellLimit.quantity === '1.234' && sellLimit.price === '10.1', `卖出限价精度错误: ${JSON.stringify(sellLimit)}`)
+    const buyLimit = normalizeBinanceOrder(paperOrder({ symbol: 'BTCUSDT', type: 'LIMIT', quantity: '1.2349', price: '10.09' }), rules)
+    assert(buyLimit.price === '10', `买入限价未向下按 tick 规整: ${buyLimit.price}`)
+    const minQuantityReject = await expectReject(
+      () => Promise.resolve(normalizeBinanceOrder(paperOrder({ symbol: 'BTCUSDT', quantity: '0.004', marketPrice: '1000' }), rules)),
+      /最小步长|最小数量/,
+    )
+    const minNotionalReject = await expectReject(
+      () => Promise.resolve(normalizeBinanceOrder(paperOrder({ symbol: 'BTCUSDT', quantity: '0.1', marketPrice: '10' }), rules)),
+      /名义价值低于最小值 5/,
+    )
+
+    const spotSnapshot = buildBinanceSpotSnapshot({
+      environment: 'live', now: 123,
+      account: { balances: [{ asset: 'BTC', free: '1.25', locked: '2.75' }, { asset: 'USDT', free: '100', locked: '0' }] },
+      tickers: [{ symbol: 'BTCUSDT', lastPrice: '10', priceChangePercent: '1' }],
+    })
+    const spotPosition = spotSnapshot.portfolio[0]
+    assert(spotPosition.quantity === '4' && spotPosition.availableQuantity === '1.25' && spotPosition.lockedQuantity === '2.75', `现货总量/可用量边界错误: ${JSON.stringify(spotPosition)}`)
+    return { requests, marketQuantity: marketOrder.quantity, sellLimitPrice: sellLimit.price, buyLimitPrice: buyLimit.price, minQuantityReject, minNotionalReject, total: spotPosition.quantity, available: spotPosition.availableQuantity }
+  })
 
   await verify('Paper 现货买卖与收益', async () => {
     const symbol = 'QASPOTUSDT'
@@ -206,6 +257,55 @@ try {
     return { positions: positions.map((position) => ({ side: position.positionSide, liquidationPrice: position.liquidationPrice, initialMargin: position.initialMargin, maintMargin: position.maintMargin })), bothReject, reduceOnlyReject, modeWithPositionReject, finalMode: mode.positionMode }
   })
 
+  await verify('逐仓位平仓订单语义', async () => {
+    const spotSymbol = 'QACLOSESPOTUSDT'
+    await placeOrder(paperOrder({ symbol: spotSymbol, side: 'BUY', quantity: '4', marketPrice: '100' }))
+    await placeOrder(paperOrder({ symbol: spotSymbol, side: 'SELL', quantity: '1.5', marketPrice: '110' }))
+    let state = await readPaperState()
+    let spotHolding = state.spot.holdings.find((holding) => holding.symbol === spotSymbol)
+    assert(almostEqual(spotHolding?.quantity, 2.5), `现货部分平仓后应剩余 2.5，实际 ${spotHolding?.quantity}`)
+    const spotOverCloseReject = await expectReject(
+      () => placeOrder(paperOrder({ symbol: spotSymbol, side: 'SELL', quantity: '3', marketPrice: '110' })),
+      /可用余额不足/,
+    )
+    const pendingSpotClose = await placeOrder(paperOrder({ symbol: spotSymbol, side: 'SELL', type: 'LIMIT', quantity: '2.5', price: '120', marketPrice: '110' }))
+    assert(pendingSpotClose.status === 'NEW', `未触价现货平仓单应为 NEW，实际 ${pendingSpotClose.status}`)
+    await getAccountSnapshot({ environment: 'paper', marketType: 'spot', symbol: spotSymbol, markPrice: 125 })
+    state = await readPaperState()
+    spotHolding = state.spot.holdings.find((holding) => holding.symbol === spotSymbol)
+    assert(!spotHolding, '限价触发后现货仓位应全部平掉')
+
+    const oneWaySymbol = 'QACLOSEONEWAYUSDT'
+    await placeOrder(paperOrder({ symbol: oneWaySymbol, marketType: 'futures', side: 'BUY', quantity: '3', marketPrice: '100', positionSide: 'BOTH' }))
+    await placeOrder(paperOrder({ symbol: oneWaySymbol, marketType: 'futures', side: 'SELL', quantity: '1', marketPrice: '110', positionSide: 'BOTH', reduceOnly: true }))
+    let oneWaySnapshot = await getAccountSnapshot({ environment: 'paper', marketType: 'futures', symbol: oneWaySymbol, markPrice: 110 })
+    assert(almostEqual(oneWaySnapshot.portfolio.find((position) => position.symbol === oneWaySymbol)?.quantity, 2), '单向合约部分平仓后数量错误')
+    const oneWayOverCloseReject = await expectReject(
+      () => placeOrder(paperOrder({ symbol: oneWaySymbol, marketType: 'futures', side: 'SELL', quantity: '3', marketPrice: '110', positionSide: 'BOTH', reduceOnly: true })),
+      /只减仓数量不能超过当前持仓/,
+    )
+    await placeOrder(paperOrder({ symbol: oneWaySymbol, marketType: 'futures', side: 'SELL', quantity: '2', marketPrice: '110', positionSide: 'BOTH', reduceOnly: true }))
+    oneWaySnapshot = await getAccountSnapshot({ environment: 'paper', marketType: 'futures', symbol: oneWaySymbol, markPrice: 110 })
+    assert(!oneWaySnapshot.portfolio.some((position) => position.symbol === oneWaySymbol), '单向合约全部平仓后仍有仓位')
+
+    const hedgeSymbol = 'QACLOSEHEDGEUSDT'
+    await setFuturesPositionMode({ environment: 'paper', symbol: hedgeSymbol, positionMode: 'HEDGE' })
+    await placeOrder(paperOrder({ symbol: hedgeSymbol, marketType: 'futures', side: 'SELL', quantity: '3', marketPrice: '100', positionSide: 'SHORT' }))
+    await placeOrder(paperOrder({ symbol: hedgeSymbol, marketType: 'futures', side: 'BUY', quantity: '1', marketPrice: '90', positionSide: 'SHORT' }))
+    let hedgeSnapshot = await getAccountSnapshot({ environment: 'paper', marketType: 'futures', symbol: hedgeSymbol, positionSide: 'SHORT', markPrice: 90 })
+    assert(almostEqual(hedgeSnapshot.portfolio.find((position) => position.symbol === hedgeSymbol && position.positionSide === 'SHORT')?.quantity, 2), '双向 SHORT 部分平仓后数量错误')
+    const hedgeOverCloseReject = await expectReject(
+      () => placeOrder(paperOrder({ symbol: hedgeSymbol, marketType: 'futures', side: 'BUY', quantity: '3', marketPrice: '90', positionSide: 'SHORT' })),
+      /平空数量不能超过 SHORT 持仓/,
+    )
+    await placeOrder(paperOrder({ symbol: hedgeSymbol, marketType: 'futures', side: 'BUY', quantity: '2', marketPrice: '90', positionSide: 'SHORT' }))
+    hedgeSnapshot = await getAccountSnapshot({ environment: 'paper', marketType: 'futures', symbol: hedgeSymbol, positionSide: 'SHORT', markPrice: 90 })
+    assert(!hedgeSnapshot.portfolio.some((position) => position.symbol === hedgeSymbol), '双向合约全部平仓后仍有仓位')
+    await setFuturesPositionMode({ environment: 'paper', symbol: hedgeSymbol, positionMode: 'ONE_WAY' })
+
+    return { spotOverCloseReject, oneWayOverCloseReject, hedgeOverCloseReject, spotLimitStatus: pendingSpotClose.status }
+  })
+
   await verify('Paper futures 杠杆、逐仓/全仓与保证金', async () => {
     const symbol = 'QAMARGINUSDT'
     let config = await setFuturesLeverage({ environment: 'paper', symbol, leverage: 10 })
@@ -260,7 +360,7 @@ try {
     return { leverage: config.leverage, marginType: config.marginType, isolatedMargin: config.isolatedMargin, removeReject, balanceReject, marginModeWithPositionReject, crossedReject, leverageReject, orderBalanceReject }
   })
 
-  await verify('Agent 持久化、重启暂停、阶段日志与 Live 不自动下单', async () => {
+  await verify('Agent 持久化、立即评估、重启续跑与 Live 不自动下单', async () => {
     const agentDirectory = join(userDataDirectory, 'agents-qa')
     const callbacks = new Map()
     const histories = new Map()
@@ -303,6 +403,8 @@ try {
     await runtime.start(idleAgent.id)
     callbacks.get('ETHUSDT')({ type: 'kline', closed: true, symbol: 'ETHUSDT', interval: '1m', candle: flatCandles.at(-1) })
     await waitFor(async () => (await runtime.logs({ agentId: idleAgent.id })).some((event) => event.type === 'COMPLETED'))
+    const manualCheck = await runtime.evaluateNow(idleAgent.id)
+    assert(typeof manualCheck.evaluated === 'boolean', '立即评估没有返回结构化结果')
 
     const liveLogs = await runtime.logs({ agentId: liveAgent.id, limit: 100 })
     const idleLogs = await runtime.logs({ agentId: idleAgent.id, limit: 100 })
@@ -323,10 +425,181 @@ try {
     })
     const afterRestart = await restarted.list()
     assert(afterRestart.length === 2, `重启后应恢复 2 个 Agent，实际 ${afterRestart.length}`)
-    assert(afterRestart.every((agent) => agent.status === 'paused'), '重启后存在未暂停 Agent')
+    assert(afterRestart.every((agent) => agent.status === 'running'), '重启后运行中的 Agent 没有自动续跑')
+    assert(callbacks.has('BTCUSDT') && callbacks.has('ETHUSDT'), '重启后没有恢复行情订阅')
+    await waitFor(async () => (await restarted.logs({ limit: 100 })).filter((event) => event.type === 'agent.resumed').length === 2)
     assert(submittedLiveOrders === 0, '重启加载期间发生 Live 自动下单')
     await restarted.close()
-    return { agents: afterRestart.length, allPaused: true, pendingLiveIntents: beforeRestart.find((agent) => agent.id === liveAgent.id).pendingIntents.length, liveAdapterCalls: submittedLiveOrders, stages: requiredStages }
+    return { agents: afterRestart.length, allResumed: true, immediateEvaluation: true, pendingLiveIntents: beforeRestart.find((agent) => agent.id === liveAgent.id).pendingIntents.length, liveAdapterCalls: submittedLiveOrders, stages: requiredStages }
+  })
+
+  await verify('Agent 失败重试、HEDGE 平仓与生产确认互斥', async () => {
+    const crossingCandles = [100, 100, 100, 90, 110].map((close, index) => ({
+      time: index + 1,
+      open: close,
+      high: close + 1,
+      low: close - 1,
+      close,
+      volume: 10,
+    }))
+    const createMarketHub = () => ({
+      callbacks: new Map(),
+      subscribeInternal(options, callback) {
+        this.callbacks.set(options.symbol, callback)
+        return () => this.callbacks.delete(options.symbol)
+      },
+      async history() {
+        return crossingCandles
+      },
+    })
+
+    const retryHub = createMarketHub()
+    let retrySnapshots = 0
+    let retryOrders = 0
+    const retryRuntime = new AgentRuntime({
+      dataDirectory: join(userDataDirectory, 'agents-retry-qa'),
+      marketHub: retryHub,
+      placeOrder: async (order) => {
+        retryOrders += 1
+        return { ...order, status: 'FILLED' }
+      },
+      getAccountSnapshot: async () => {
+        retrySnapshots += 1
+        if (retrySnapshots === 1) throw new Error('temporary account outage')
+        return { totalWalletBalance: 25_000, availableBalance: 25_000, portfolio: [] }
+      },
+      isExecutionHalted: () => false,
+    })
+    const retryAgent = await retryRuntime.create({
+      name: 'QA Retry EMA', strategy: 'ma-crossover', environment: 'paper', marketType: 'spot', symbol: 'BTCUSDT', interval: '1m',
+      params: { maType: 'EMA', fastPeriod: 2, slowPeriod: 3 }, risk: { riskFraction: 0.005, maxNotional: 100 },
+    })
+    await retryRuntime.start(retryAgent.id)
+    const failedRetryResult = await retryRuntime.evaluateNow(retryAgent.id)
+    assert(failedRetryResult.evaluated === false && failedRetryResult.reason === 'error' && /temporary account outage/.test(failedRetryResult.error || ''), `立即评估失败没有返回结构化错误: ${JSON.stringify(failedRetryResult)}`)
+    await waitFor(async () => (await retryRuntime.logs({ agentId: retryAgent.id })).some((event) => event.type === 'evaluation.failed'))
+    let retryState = (await retryRuntime.list()).find((agent) => agent.id === retryAgent.id)
+    assert(!retryState.runtime.lastEvaluatedCandle, '失败的 K 线不应被标记为已完成')
+    const retryResult = await retryRuntime.evaluateNow(retryAgent.id)
+    assert(retryResult.evaluated === true, `临时失败后应重试同一根 K 线，实际 ${JSON.stringify(retryResult)}`)
+    retryState = (await retryRuntime.list()).find((agent) => agent.id === retryAgent.id)
+    assert(retryState.runtime.lastEvaluatedCandle === crossingCandles.at(-1).time, '成功重试后没有记录已完成 K 线')
+    assert(retryOrders === 1, `同一根 K 线成功重试后应只下单一次，实际 ${retryOrders}`)
+    const duplicateResult = await retryRuntime.evaluateNow(retryAgent.id)
+    assert(duplicateResult.reason === 'already-evaluated' && retryOrders === 1, '成功 K 线被重复执行')
+    await retryRuntime.pause(retryAgent.id)
+    await retryRuntime.close()
+
+    const liveRetryHub = createMarketHub()
+    let liveRetrySnapshots = 0
+    let liveRetryAdapterCalls = 0
+    const liveRetryRuntime = new AgentRuntime({
+      dataDirectory: join(userDataDirectory, 'agents-live-retry-qa'),
+      marketHub: liveRetryHub,
+      placeOrder: async () => {
+        liveRetryAdapterCalls += 1
+        throw new Error('未确认的生产意图不应调用下单适配器')
+      },
+      getAccountSnapshot: async () => {
+        liveRetrySnapshots += 1
+        if (liveRetrySnapshots === 1) throw new Error('temporary live account outage')
+        return { totalWalletBalance: 25_000, availableBalance: 25_000, futuresConfig: { positionMode: 'ONE_WAY' }, portfolio: [] }
+      },
+      isExecutionHalted: () => false,
+    })
+    const liveRetryAgent = await liveRetryRuntime.create({
+      name: 'QA Live Retry EMA', strategy: 'ma-crossover', environment: 'live', marketType: 'futures', symbol: 'BTCUSDT', interval: '1m',
+      params: { maType: 'EMA', fastPeriod: 2, slowPeriod: 3 }, risk: { riskFraction: 0.005, maxNotional: 100 },
+    })
+    await liveRetryRuntime.start(liveRetryAgent.id)
+    const failedLiveRetry = await liveRetryRuntime.evaluateNow(liveRetryAgent.id)
+    assert(failedLiveRetry.evaluated === false && failedLiveRetry.reason === 'error', 'Live 临时失败没有保留重试资格')
+    const liveRetryResults = await Promise.all([
+      liveRetryRuntime.evaluateNow(liveRetryAgent.id),
+      liveRetryRuntime.evaluateNow(liveRetryAgent.id),
+    ])
+    assert(liveRetryResults.every((result) => result.evaluated === true), '并发重试没有复用同一次成功评估')
+    const liveRetryState = (await liveRetryRuntime.list()).find((agent) => agent.id === liveRetryAgent.id)
+    assert(liveRetryState.pendingIntents?.length === 1, `同一根重试 K 线生成了 ${liveRetryState.pendingIntents?.length || 0} 个生产意图`)
+    assert(liveRetryAdapterCalls === 0, 'Live 重试在未确认时调用了下单适配器')
+    const completedLiveRetry = await liveRetryRuntime.evaluateNow(liveRetryAgent.id)
+    assert(completedLiveRetry.reason === 'already-evaluated' && liveRetryState.pendingIntents.length === 1, '完成后的 Live K 线被重复评估')
+    await liveRetryRuntime.pause(liveRetryAgent.id)
+    await liveRetryRuntime.close()
+
+    const hedgeHub = createMarketHub()
+    const hedgeOrders = []
+    const hedgePosition = { symbol: 'BTCUSDT', marketType: 'futures', side: 'SHORT', positionSide: 'SHORT', quantity: '2', positionAmt: '-2' }
+    const hedgeRuntime = new AgentRuntime({
+      dataDirectory: join(userDataDirectory, 'agents-hedge-close-qa'),
+      marketHub: hedgeHub,
+      placeOrder: async (order) => {
+        hedgeOrders.push(order)
+        return { ...order, status: 'FILLED' }
+      },
+      getAccountSnapshot: async () => ({
+        totalWalletBalance: 25_000,
+        availableBalance: 0,
+        futuresConfig: { positionMode: 'HEDGE' },
+        portfolio: [hedgePosition],
+      }),
+      isExecutionHalted: () => false,
+    })
+    const hedgeAgent = await hedgeRuntime.create({
+      name: 'QA HEDGE Close', strategy: 'ma-crossover', environment: 'paper', marketType: 'futures', symbol: 'BTCUSDT', interval: '1m',
+      params: { maType: 'EMA', fastPeriod: 2, slowPeriod: 3 }, risk: { riskFraction: 0.005, maxNotional: 100 },
+    })
+    await hedgeRuntime.start(hedgeAgent.id)
+    await waitFor(() => hedgeOrders.length === 1)
+    assert(hedgeOrders[0].side === 'BUY' && hedgeOrders[0].positionSide === 'SHORT', 'HEDGE SHORT 没有使用 BUY + SHORT 平仓')
+    assert(!hedgeOrders[0].reduceOnly, 'HEDGE 平仓不应向 Binance 发送 reduceOnly')
+    assert(Number(hedgeOrders[0].quantity) === 2, 'HEDGE 平仓没有使用完整持仓数量')
+    await hedgeRuntime.pause(hedgeAgent.id)
+    await hedgeRuntime.close()
+
+    const confirmHub = createMarketHub()
+    let confirmedOrders = 0
+    const confirmRuntime = new AgentRuntime({
+      dataDirectory: join(userDataDirectory, 'agents-confirm-lock-qa'),
+      marketHub: confirmHub,
+      placeOrder: async (order) => {
+        confirmedOrders += 1
+        await new Promise((resolve) => setTimeout(resolve, 40))
+        return { ...order, status: 'FILLED' }
+      },
+      getAccountSnapshot: async () => ({
+        totalWalletBalance: 25_000,
+        availableBalance: 25_000,
+        futuresConfig: { positionMode: 'ONE_WAY' },
+        portfolio: [],
+      }),
+      isExecutionHalted: () => false,
+    })
+    const confirmAgent = await confirmRuntime.create({
+      name: 'QA Confirm Lock', strategy: 'ma-crossover', environment: 'live', marketType: 'futures', symbol: 'BTCUSDT', interval: '1m',
+      params: { maType: 'EMA', fastPeriod: 2, slowPeriod: 3 }, risk: { riskFraction: 0.005, maxNotional: 100 },
+    })
+    await confirmRuntime.start(confirmAgent.id)
+    await waitFor(async () => (await confirmRuntime.list()).some((agent) => agent.id === confirmAgent.id && agent.pendingIntents?.length === 1))
+    const pendingIntent = (await confirmRuntime.list()).find((agent) => agent.id === confirmAgent.id).pendingIntents[0]
+    const confirmations = await Promise.all([
+      confirmRuntime.confirmIntent(pendingIntent.id),
+      confirmRuntime.confirmIntent(pendingIntent.id),
+    ])
+    assert(confirmedOrders === 1, `并发确认同一生产意图调用了 ${confirmedOrders} 次下单适配器`)
+    assert(confirmations[0].intent.status === 'executed' && confirmations[1].intent.status === 'executed', '并发确认没有复用同一执行结果')
+    await confirmRuntime.pause(confirmAgent.id)
+    await confirmRuntime.close()
+
+    return {
+      retrySnapshots,
+      retryOrders,
+      failedEvaluateNow: failedRetryResult.reason,
+      retryLivePendingIntents: liveRetryState.pendingIntents.length,
+      retryLiveAdapterCalls: liveRetryAdapterCalls,
+      hedgeClose: { side: hedgeOrders[0].side, positionSide: hedgeOrders[0].positionSide, reduceOnly: Boolean(hedgeOrders[0].reduceOnly) },
+      concurrentConfirmationAdapterCalls: confirmedOrders,
+    }
   })
 
   const persistedPaper = JSON.parse(await readFile(join(userDataDirectory, 'paper', 'account.json'), 'utf8'))

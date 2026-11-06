@@ -76,6 +76,8 @@ export interface PortfolioPosition {
   marketType: MarketType
   side: 'LONG' | 'SHORT'
   quantity: string
+  availableQuantity?: string
+  lockedQuantity?: string
   positionAmt?: string
   entryPrice: string
   markPrice: string
@@ -157,6 +159,13 @@ export interface AgentDefinition {
   risk: AgentRiskSettings
   runtime: {
     lastEvaluatedCandle?: number
+    lastEvaluatedAt?: number
+    lastCheckAt?: number
+    lastHeartbeatAt?: number
+    nextEvaluationAt?: number
+    startedAt?: number
+    marketConnected?: boolean
+    lastError?: string
     position?: 'flat' | 'long' | 'short'
   }
   pendingIntents?: AgentIntent[]

@@ -37,7 +37,11 @@ const strategyLabels: Record<AgentStrategy, string> = {
 const eventLabels: Record<string, string> = {
   'agent.created': '已创建',
   'agent.started': '已启动',
+  'agent.resumed': '已恢复',
+  'agent.checked': '运行检查',
   'agent.paused': '已暂停',
+  'market.connected': '行情已连接',
+  'market.disconnected': '行情重连中',
   'evaluation.failed': '评估失败',
   MARKET_SNAPSHOT: '市场快照',
   POSITION_RECONCILED: '持仓同步',
@@ -203,8 +207,10 @@ interface AgentsViewProps {
   loading: boolean
   error: string | null
   busyAgentIds: Set<string>
+  evaluatingAgentIds: Set<string>
   busyIntentIds: Set<string>
   onToggle: (agent: AgentDefinition) => Promise<void>
+  onEvaluate: (agent: AgentDefinition) => Promise<void>
   onConfirmIntent: (intent: AgentIntent) => Promise<void>
   onRefresh: () => Promise<void>
   onNew: () => void
@@ -240,7 +246,7 @@ function IntentPanel({ intent, busy, now, onConfirm }: { intent: AgentIntent; bu
   )
 }
 
-export function AgentsView({ agents, logs, account, currentEnvironment, loading, error, busyAgentIds, busyIntentIds, onToggle, onConfirmIntent, onRefresh, onNew }: AgentsViewProps) {
+export function AgentsView({ agents, logs, account, currentEnvironment, loading, error, busyAgentIds, evaluatingAgentIds, busyIntentIds, onToggle, onEvaluate, onConfirmIntent, onRefresh, onNew }: AgentsViewProps) {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [now, setNow] = useState(0)
 
@@ -294,10 +300,16 @@ export function AgentsView({ agents, logs, account, currentEnvironment, loading,
             <section className="panel agent-detail-head">
               <header>
                 <div className="agent-detail-title"><span className="agent-icon"><Bot size={18} /></span><div><h2>{selected.name}</h2><p>{selected.symbol} · {marketLabel(selected.marketType)} · {strategyLabels[selected.strategy]}</p></div></div>
-                <button className="secondary-button" disabled={busyAgentIds.has(selected.id)} onClick={() => void onToggle(selected)}>
-                  {busyAgentIds.has(selected.id) ? <RefreshCw className="spin" size={16} /> : selected.status === 'running' ? <Pause size={16} /> : <Play size={16} />}
-                  {busyAgentIds.has(selected.id) ? '处理中' : selected.status === 'running' ? '暂停 Agent' : '启动 Agent'}
-                </button>
+                <div className="agent-detail-actions">
+                  <button className="secondary-button" disabled={selected.status !== 'running' || evaluatingAgentIds.has(selected.id)} onClick={() => void onEvaluate(selected)}>
+                    <Activity className={evaluatingAgentIds.has(selected.id) ? 'spin' : ''} size={16} />
+                    {evaluatingAgentIds.has(selected.id) ? '评估中' : '立即评估'}
+                  </button>
+                  <button className="secondary-button" disabled={busyAgentIds.has(selected.id)} onClick={() => void onToggle(selected)}>
+                    {busyAgentIds.has(selected.id) ? <RefreshCw className="spin" size={16} /> : selected.status === 'running' ? <Pause size={16} /> : <Play size={16} />}
+                    {busyAgentIds.has(selected.id) ? '处理中' : selected.status === 'running' ? '暂停 Agent' : '启动 Agent'}
+                  </button>
+                </div>
               </header>
               <div className="agent-detail-grid">
                 <div><span>运行状态</span><AgentState agent={selected} /></div>
@@ -306,7 +318,10 @@ export function AgentsView({ agents, logs, account, currentEnvironment, loading,
                 <div><span>策略持仓</span><strong>{selected.runtime.position === 'long' ? '多头' : selected.runtime.position === 'short' ? '空头' : '空仓'}</strong></div>
                 <div><span>单笔风险</span><strong>{formatNumber(selected.risk.riskFraction * 100)}%</strong></div>
                 <div><span>名义上限</span><strong>{formatNumber(selected.risk.maxNotional)} USDT</strong></div>
-                <div><span>最近评估</span><strong>{formatTime(selected.runtime.lastEvaluatedCandle)}</strong></div>
+                <div><span>最近评估</span><strong>{formatTime(selected.runtime.lastEvaluatedAt)}</strong></div>
+                <div><span>运行心跳</span><strong>{formatTime(selected.runtime.lastHeartbeatAt || selected.runtime.lastCheckAt)}</strong></div>
+                <div><span>下次检查</span><strong>{selected.status === 'running' ? formatTime(selected.runtime.nextEvaluationAt) : '--'}</strong></div>
+                <div><span>行情链路</span><strong className={selected.runtime.marketConnected ? 'text-positive' : 'agent-value-muted'}>{selected.status !== 'running' ? '未订阅' : selected.runtime.marketConnected ? '实时' : '重连 / REST 补偿'}</strong></div>
                 <div><span>关联持仓盈亏</span><PositionPnl position={position} /></div>
               </div>
               {!position && <p className="agent-position-note"><WalletCards size={14} />{selected.environment !== currentEnvironment ? `顶部账户当前为${environmentLabel(currentEnvironment)}，切换到${environmentLabel(selected.environment)}后可关联持仓` : account?.marketType !== selected.marketType ? `顶部市场当前为${marketLabel(account?.marketType || 'spot')}，切换到${marketLabel(selected.marketType)}后可关联持仓` : '该 Agent 当前没有匹配持仓'}</p>}

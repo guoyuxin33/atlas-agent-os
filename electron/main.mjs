@@ -3,7 +3,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AgentRuntime } from './services/agent-runtime.mjs'
 import { chatWithModel } from './services/ai.mjs'
-import { adjustFuturesPositionMargin, getAccountSnapshot, getFuturesConfiguration, getFuturesPositionMode, getOrders, placeOrder, setFuturesLeverage, setFuturesMarginType, setFuturesPositionMode, testBinanceConnection } from './services/binance.mjs'
+import { adjustFuturesPositionMargin, getAccountSnapshot, getFuturesConfiguration, getFuturesPositionMode, getOrders, placeOrder, prepareBinanceOrder, setFuturesLeverage, setFuturesMarginType, setFuturesPositionMode, testBinanceConnection } from './services/binance.mjs'
 import { ChatSessionStore } from './services/chat-sessions.mjs'
 import { MarketDataHub } from './services/market-data.mjs'
 import { callMcpTool, connectMcp } from './services/mcp.mjs'
@@ -185,6 +185,7 @@ ipcMain.handle('binance:setFuturesLeverage', (_event, options) => setFuturesLeve
 ipcMain.handle('binance:setFuturesMarginType', (_event, options) => setFuturesMarginType(options))
 ipcMain.handle('binance:setFuturesPositionMode', (_event, options) => setFuturesPositionMode(options))
 ipcMain.handle('binance:adjustFuturesMargin', (_event, options) => adjustFuturesPositionMargin(options))
+ipcMain.handle('binance:prepareOrder', (_event, order) => prepareBinanceOrder(order))
 ipcMain.handle('binance:subscribeAccount', (event, options) => userDataHub.subscribe(event.sender, options))
 ipcMain.handle('binance:unsubscribeAccount', (event, options) => userDataHub.unsubscribe(event.sender, options))
 ipcMain.handle('binance:placeOrder', (_event, order) => {
@@ -200,6 +201,7 @@ ipcMain.handle('risk:status', () => ({ halted: executionHalted }))
 ipcMain.handle('agents:create', async (_event, definition) => (await getAgentRuntime()).create(definition))
 ipcMain.handle('agents:start', async (_event, agentId) => (await getAgentRuntime()).start(agentId))
 ipcMain.handle('agents:pause', async (_event, agentId) => (await getAgentRuntime()).pause(agentId))
+ipcMain.handle('agents:evaluate-now', async (_event, agentId) => (await getAgentRuntime()).evaluateNow(agentId))
 ipcMain.handle('agents:list', async () => (await getAgentRuntime()).list())
 ipcMain.handle('agents:logs', async (_event, options) => (await getAgentRuntime()).logs(options))
 ipcMain.handle('agents:confirm-intent', async (_event, intentId) => (await getAgentRuntime()).confirmIntent(intentId))

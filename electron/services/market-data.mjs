@@ -1,4 +1,5 @@
 import WebSocket from 'ws'
+import { exchangeInfoCatalog } from './exchange-info.mjs'
 import { fetchWithProxy, webSocketOptions } from './network.mjs'
 
 const REST_BASE = {
@@ -11,7 +12,6 @@ const WS_BASE = {
   futures: 'wss://fstream.binance.com/ws',
 }
 
-const MARKET_CACHE_TTL = 5 * 60 * 1000
 const HISTORY_CACHE_TTL = 15 * 1000
 const HISTORY_CACHE_LIMIT = 24
 const IPC_BATCH_INTERVAL = 16
@@ -125,7 +125,6 @@ export class MarketDataHub {
   constructor() {
     this.clients = new Map()
     this.topicsByClient = new Map()
-    this.marketCache = new Map()
     this.historyCache = new Map()
     this.pendingUpdatesByClient = new Map()
     this.flushTimersByClient = new Map()
@@ -244,35 +243,7 @@ export class MarketDataHub {
 
   async markets(options = {}) {
     const marketType = options.marketType === 'futures' ? 'futures' : 'spot'
-    const cached = this.marketCache.get(marketType)
-    if (cached?.data && cached.expiresAt > Date.now()) return cached.data
-    if (cached?.request) return cached.request
-
-    const path = marketType === 'futures' ? '/fapi/v1/exchangeInfo' : '/api/v3/exchangeInfo'
-    const request = (async () => {
-      const response = await fetchWithProxy(`${REST_BASE[marketType]}${path}`)
-      const payload = await response.json()
-      if (!response.ok) throw new Error(payload?.msg || `Market catalog request failed (${response.status})`)
-      const markets = (Array.isArray(payload?.symbols) ? payload.symbols : [])
-        .filter((market) => market.status === 'TRADING' && market.quoteAsset === 'USDT' && (marketType !== 'futures' || market.contractType === 'PERPETUAL'))
-        .map((market) => ({
-          symbol: market.symbol,
-          baseAsset: market.baseAsset,
-          quoteAsset: market.quoteAsset,
-          status: market.status,
-        }))
-        .sort((left, right) => left.symbol.localeCompare(right.symbol))
-      this.marketCache.set(marketType, { data: markets, expiresAt: Date.now() + MARKET_CACHE_TTL })
-      return markets
-    })()
-
-    this.marketCache.set(marketType, { request, expiresAt: 0 })
-    try {
-      return await request
-    } catch (error) {
-      if (this.marketCache.get(marketType)?.request === request) this.marketCache.delete(marketType)
-      throw error
-    }
+    return exchangeInfoCatalog.markets({ marketType, baseUrl: REST_BASE[marketType] })
   }
 
   async history(options) {

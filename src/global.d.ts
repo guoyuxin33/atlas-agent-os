@@ -26,6 +26,7 @@ interface Window {
       setFuturesMarginType: (options: import('./types').FuturesAccountMutation & { marginType: 'CROSSED' | 'ISOLATED' }) => Promise<import('./types').FuturesConfiguration>
       setFuturesPositionMode: (options: import('./types').FuturesAccountMutation & { positionMode: import('./types').FuturesPositionMode }) => Promise<import('./types').FuturesPositionModeResult>
       adjustFuturesMargin: (options: import('./types').FuturesAccountMutation & { amount: number; action: 'ADD' | 'REMOVE'; positionSide?: 'LONG' | 'SHORT' | 'BOTH' }) => Promise<import('./types').FuturesConfiguration>
+      prepareOrder: (order: import('./types').TradingOrder) => Promise<import('./types').TradingOrder>
       placeOrder: (order: import('./types').TradingOrder) => Promise<import('./types').TradingOrder>
       subscribeAccount: (options: { environment: string; marketType: string }) => Promise<{ ok: boolean; mode: string; topic?: string }>
       unsubscribeAccount: (options: { environment: string; marketType: string }) => Promise<{ ok: boolean }>
@@ -39,6 +40,7 @@ interface Window {
       create: (definition: import('./types').AgentCreateInput) => Promise<import('./types').AgentDefinition>
       start: (agentId: string) => Promise<import('./types').AgentDefinition>
       pause: (agentId: string) => Promise<import('./types').AgentDefinition>
+      evaluateNow: (agentId: string) => Promise<{ evaluated: boolean; reason?: string; candleTime?: number; error?: string }>
       list: () => Promise<import('./types').AgentDefinition[]>
       logs: (options?: { agentId?: string; limit?: number; after?: number }) => Promise<import('./types').AgentEvent[]>
       confirmIntent: (intentId: string) => Promise<{ intent: import('./types').AgentIntent; order: import('./types').TradingOrder }>

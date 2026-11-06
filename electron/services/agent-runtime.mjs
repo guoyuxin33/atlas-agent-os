@@ -9,6 +9,16 @@ const INTERVALS = new Set(['1m', '5m', '15m', '1h', '4h', '1d'])
 const MAX_LOGS_IN_MEMORY = 10_000
 const LIVE_INTENT_TTL = 30_000
 const MAX_CONFIRMATION_PRICE_DEVIATION = 0.005
+const WATCHDOG_INTERVAL = 30_000
+
+const INTERVAL_MS = {
+  '1m': 60_000,
+  '5m': 5 * 60_000,
+  '15m': 15 * 60_000,
+  '1h': 60 * 60_000,
+  '4h': 4 * 60 * 60_000,
+  '1d': 24 * 60 * 60_000,
+}
 
 const STRATEGY_DEFAULTS = {
   'ma-crossover': { maType: 'EMA', fastPeriod: 9, slowPeriod: 21, stopPercent: 0.01 },
@@ -82,7 +92,7 @@ function safeAgent(saved) {
       ...normalized,
       id: String(saved.id),
       name: String(saved.name || normalized.name).slice(0, 80),
-      status: 'paused',
+      status: saved.status === 'running' ? 'running' : 'paused',
       runtime: saved.runtime && typeof saved.runtime === 'object' ? { ...saved.runtime } : { position: 'flat' },
       createdAt: finiteNumber(saved.createdAt, normalized.createdAt),
       updatedAt: Date.now(),
@@ -196,6 +206,13 @@ function eventIntent(event) {
   return intent
 }
 
+function isClosingOrder(order) {
+  if (order.reduceOnly) return true
+  if (order.marketType !== 'futures') return false
+  return (order.positionSide === 'LONG' && order.side === 'SELL')
+    || (order.positionSide === 'SHORT' && order.side === 'BUY')
+}
+
 export class AgentRuntime {
   constructor({ dataDirectory, marketHub, placeOrder, getAccountSnapshot, isExecutionHalted }) {
     if (!dataDirectory) throw new Error('Agent runtime data directory is required')
@@ -211,8 +228,11 @@ export class AgentRuntime {
     this.events = []
     this.subscriptions = new Map()
     this.evaluationQueues = new Map()
+    this.latestChecks = new Map()
+    this.intentConfirmations = new Map()
     this.writeQueue = Promise.resolve()
     this.initialization = null
+    this.watchdogTimer = null
   }
 
   initialize() {
@@ -249,6 +269,13 @@ export class AgentRuntime {
     }
 
     if (this.agents.size) await this.#persistDefinitions()
+    const resumable = [...this.agents.values()].filter((agent) => agent.status === 'running')
+    for (const agent of resumable) {
+      this.#subscribe(agent)
+      await this.#log(agent.id, 'agent.resumed', 'info', `主进程已恢复 ${agent.symbol} ${agent.interval} 行情订阅`)
+      this.#scheduleLatestCheck(agent.id, 'resume')
+    }
+    this.#syncWatchdog()
   }
 
   async create(input) {
@@ -264,20 +291,20 @@ export class AgentRuntime {
     await this.initialize()
     const agent = this.#requireAgent(agentId)
     if (agent.status === 'running' && this.subscriptions.has(agent.id)) return structuredClone(agent)
-    const unsubscribe = this.marketHub.subscribeInternal(agent, (update) => {
-      if (update.type !== 'kline' || !update.closed || update.symbol !== agent.symbol || update.interval !== agent.interval) return
-      const previous = this.evaluationQueues.get(agent.id) || Promise.resolve()
-      const queued = previous.catch(() => {}).then(() => this.#evaluate(agent.id, update)).catch((error) => {
-        console.error('[agents:evaluate]', error)
-      })
-      this.evaluationQueues.set(agent.id, queued)
-    })
-    this.subscriptions.get(agent.id)?.()
-    this.subscriptions.set(agent.id, unsubscribe)
     agent.status = 'running'
+    agent.runtime = {
+      ...agent.runtime,
+      startedAt: Date.now(),
+      lastCheckAt: Date.now(),
+      marketConnected: false,
+      nextEvaluationAt: this.#nextEvaluationAt(agent.interval),
+    }
     agent.updatedAt = Date.now()
+    this.#subscribe(agent)
     await this.#persistDefinitions()
     await this.#log(agent.id, 'agent.started', 'info', `Agent 已订阅 ${agent.symbol} ${agent.interval}`)
+    this.#syncWatchdog()
+    this.#scheduleLatestCheck(agent.id, 'start')
     return structuredClone(agent)
   }
 
@@ -287,10 +314,19 @@ export class AgentRuntime {
     this.subscriptions.get(agent.id)?.()
     this.subscriptions.delete(agent.id)
     agent.status = 'paused'
+    agent.runtime = { ...agent.runtime, marketConnected: false, nextEvaluationAt: undefined }
     agent.updatedAt = Date.now()
     await this.#persistDefinitions()
     await this.#log(agent.id, 'agent.paused', 'info', 'Agent 已暂停')
+    this.#syncWatchdog()
     return structuredClone(agent)
+  }
+
+  async evaluateNow(agentId) {
+    await this.initialize()
+    const agent = this.#requireAgent(agentId)
+    if (agent.status !== 'running') throw new Error('请先启动 Agent，再执行立即评估')
+    return this.#checkLatestClosedCandle(agent.id, 'manual')
   }
 
   async list() {
@@ -319,7 +355,18 @@ export class AgentRuntime {
 
   async confirmIntent(intentId) {
     await this.initialize()
-    const intent = this.intents.get(String(intentId))
+    const key = String(intentId)
+    const inFlight = this.intentConfirmations.get(key)
+    if (inFlight) return inFlight
+    const operation = this.#confirmIntent(key).finally(() => {
+      if (this.intentConfirmations.get(key) === operation) this.intentConfirmations.delete(key)
+    })
+    this.intentConfirmations.set(key, operation)
+    return operation
+  }
+
+  async #confirmIntent(intentId) {
+    const intent = this.intents.get(intentId)
     if (!intent) throw new Error('待确认交易不存在')
     if (intent.status !== 'pending') throw new Error('该交易意图已处理')
     if (intent.environment !== 'live') throw new Error('只有生产订单需要逐单确认')
@@ -364,9 +411,11 @@ export class AgentRuntime {
   }
 
   async close() {
+    if (this.watchdogTimer) clearInterval(this.watchdogTimer)
+    this.watchdogTimer = null
     this.subscriptions.forEach((unsubscribe) => unsubscribe())
     this.subscriptions.clear()
-    await Promise.allSettled([...this.evaluationQueues.values()])
+    await Promise.allSettled([...this.evaluationQueues.values(), ...this.latestChecks.values(), ...this.intentConfirmations.values()])
     await this.writeQueue.catch(() => {})
   }
 
@@ -376,22 +425,143 @@ export class AgentRuntime {
     return agent
   }
 
+  #subscribe(agent) {
+    this.subscriptions.get(agent.id)?.()
+    const unsubscribe = this.marketHub.subscribeInternal(agent, (update) => {
+      const current = this.agents.get(agent.id)
+      if (!current || current.status !== 'running') return
+      const now = Date.now()
+      current.runtime = { ...current.runtime, lastHeartbeatAt: now }
+      if (update.type === 'connection') {
+        const wasConnected = current.runtime.marketConnected
+        current.runtime.marketConnected = Boolean(update.connected)
+        if (wasConnected !== current.runtime.marketConnected) {
+          const eventType = update.connected ? 'market.connected' : 'market.disconnected'
+          const level = update.connected ? 'info' : 'warning'
+          const message = update.connected ? '行情 WebSocket 已连接' : '行情 WebSocket 已断开，等待自动重连并由看门狗补偿'
+          void this.#log(current.id, eventType, level, message).catch((error) => console.error('[agents:connection-log]', error))
+        }
+        return
+      }
+      if (update.type !== 'kline' || !update.closed || update.symbol !== current.symbol || update.interval !== current.interval) return
+      current.runtime.marketConnected = true
+      current.runtime.nextEvaluationAt = this.#nextEvaluationAt(current.interval)
+      this.#enqueueEvaluation(current.id, update)
+    })
+    this.subscriptions.set(agent.id, unsubscribe)
+  }
+
+  #enqueueEvaluation(agentId, update) {
+    const previous = this.evaluationQueues.get(agentId) || Promise.resolve()
+    const queued = previous.catch(() => {}).then(() => this.#evaluate(agentId, update)).catch((error) => {
+      console.error('[agents:evaluate]', error)
+    })
+    this.evaluationQueues.set(agentId, queued)
+    return queued
+  }
+
+  #scheduleLatestCheck(agentId, reason) {
+    queueMicrotask(() => {
+      void this.#checkLatestClosedCandle(agentId, reason).catch((error) => console.error('[agents:latest-check]', error))
+    })
+  }
+
+  #syncWatchdog() {
+    const hasRunningAgents = [...this.agents.values()].some((agent) => agent.status === 'running')
+    if (!hasRunningAgents && this.watchdogTimer) {
+      clearInterval(this.watchdogTimer)
+      this.watchdogTimer = null
+      return
+    }
+    if (hasRunningAgents && !this.watchdogTimer) {
+      this.watchdogTimer = setInterval(() => {
+        for (const agent of this.agents.values()) {
+          if (agent.status === 'running') this.#scheduleLatestCheck(agent.id, 'watchdog')
+        }
+      }, WATCHDOG_INTERVAL)
+      this.watchdogTimer.unref?.()
+    }
+  }
+
+  #nextEvaluationAt(interval) {
+    const duration = INTERVAL_MS[interval] || INTERVAL_MS['15m']
+    return Math.ceil((Date.now() + 1_000) / duration) * duration
+  }
+
+  #latestClosedCandle(candles, interval) {
+    const duration = INTERVAL_MS[interval] || INTERVAL_MS['15m']
+    const now = Date.now() + 2_000
+    return [...candles].reverse().find((candle) => finiteNumber(candle.time) * 1_000 + duration <= now) || null
+  }
+
+  #checkLatestClosedCandle(agentId, reason) {
+    const inFlight = this.latestChecks.get(agentId)
+    if (inFlight) return inFlight
+    const operation = (async () => {
+      const agent = this.agents.get(agentId)
+      if (!agent || agent.status !== 'running') return { evaluated: false, reason: 'paused' }
+      const now = Date.now()
+      agent.runtime = {
+        ...agent.runtime,
+        lastCheckAt: now,
+        nextEvaluationAt: this.#nextEvaluationAt(agent.interval),
+      }
+      try {
+        const history = await this.marketHub.history({ marketType: agent.marketType, symbol: agent.symbol, interval: agent.interval, limit: 100 })
+        const candle = this.#latestClosedCandle(history, agent.interval)
+        if (!candle) throw new Error('最近历史数据中没有已闭合 K 线')
+        agent.runtime = { ...agent.runtime, marketConnected: true, lastHeartbeatAt: Date.now(), lastError: undefined }
+        if (agent.runtime.lastEvaluatedCandle === finiteNumber(candle.time)) {
+          if (reason !== 'watchdog') {
+            await this.#log(agent.id, 'agent.checked', 'info', `最近闭合 K 线已评估，继续等待 ${agent.interval} 新 K 线`, { reason, candleTime: candle.time })
+          }
+          return { evaluated: false, reason: 'already-evaluated', candleTime: candle.time }
+        }
+        const result = await this.#enqueueEvaluation(agent.id, {
+          type: 'kline',
+          marketType: agent.marketType,
+          symbol: agent.symbol,
+          interval: agent.interval,
+          candle,
+          closed: true,
+          timestamp: Date.now(),
+        })
+        return result || { evaluated: false, reason: 'error', candleTime: candle.time }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '行情检查失败'
+        const changed = agent.runtime.lastError !== message
+        agent.runtime = { ...agent.runtime, marketConnected: false, lastError: message, lastCheckAt: Date.now() }
+        if (reason !== 'watchdog' || changed) await this.#log(agent.id, 'evaluation.failed', 'error', `行情检查失败：${message}`, { reason })
+        return { evaluated: false, reason: 'error', error: message }
+      }
+    })().finally(() => this.latestChecks.delete(agentId))
+    this.latestChecks.set(agentId, operation)
+    return operation
+  }
+
   async #evaluate(agentId, update) {
     const agent = this.agents.get(agentId)
-    if (!agent || agent.status !== 'running') return
+    if (!agent || agent.status !== 'running') return { evaluated: false, reason: 'paused' }
     const candleTime = finiteNumber(update.candle?.time)
-    if (!(candleTime > 0) || agent.runtime?.lastEvaluatedCandle === candleTime) return
-    agent.runtime = { ...agent.runtime, lastEvaluatedCandle: candleTime }
+    if (!(candleTime > 0)) return { evaluated: false, reason: 'invalid-candle' }
+    if (agent.runtime?.lastEvaluatedCandle === candleTime) return { evaluated: false, reason: 'already-evaluated', candleTime }
+    agent.runtime = {
+      ...agent.runtime,
+      lastCheckAt: Date.now(),
+      lastHeartbeatAt: Date.now(),
+      marketConnected: true,
+      nextEvaluationAt: this.#nextEvaluationAt(agent.interval),
+    }
     agent.updatedAt = Date.now()
-    await this.#persistDefinitions()
 
     try {
       const history = await this.marketHub.history({ marketType: agent.marketType, symbol: agent.symbol, interval: agent.interval, limit: 500 })
-      if (agent.status !== 'running') return
+      if (agent.status !== 'running') return { evaluated: false, reason: 'paused', candleTime }
       const byTime = new Map(history.filter((candle) => candle.time <= candleTime).map((candle) => [candle.time, candle]))
       byTime.set(candleTime, update.candle)
       const candles = [...byTime.values()].sort((left, right) => left.time - right.time)
       const snapshot = await this.getAccountSnapshot({ environment: agent.environment, marketType: agent.marketType, symbol: agent.symbol, markPrice: update.candle.close })
+      if (agent.status !== 'running') return { evaluated: false, reason: 'paused', candleTime }
       await this.#log(agent.id, 'MARKET_SNAPSHOT', 'info', '闭合 K 线与账户快照已就绪', {
         candleTime,
         close: update.candle.close,
@@ -408,9 +578,9 @@ export class AgentRuntime {
       const signal = evaluateStrategy(agent, candles)
       if (!signal) {
         await this.#log(agent.id, 'SIGNAL_EVALUATED', 'info', '本根闭合 K 线无交易信号', { candleTime, decision: 'NO_ACTION', strategy: agent.strategy })
-        await this.#persistDefinitions()
+        await this.#markEvaluationCompleted(agent, candleTime)
         await this.#log(agent.id, 'COMPLETED', 'info', '闭合 K 线评估结束：NO_ACTION', { candleTime })
-        return
+        return { evaluated: true, candleTime }
       }
       await this.#log(agent.id, 'SIGNAL_EVALUATED', 'info', signal.reason, { candleTime, decision: signal.direction.toUpperCase(), signal })
       await this.#log(agent.id, 'RISK_CHECKING', 'info', '正在计算仓位并执行主进程风控', { candleTime })
@@ -419,18 +589,38 @@ export class AgentRuntime {
         prepared = this.#prepareOrder(agent, snapshot, signal, update.candle.close, candleTime, position)
       } catch (error) {
         await this.#log(agent.id, 'RISK_REJECTED', 'warning', error instanceof Error ? error.message : '仓位风控未通过', { candleTime })
+        await this.#markEvaluationCompleted(agent, candleTime)
         await this.#log(agent.id, 'COMPLETED', 'info', '闭合 K 线评估结束：RISK_REJECTED', { candleTime })
-        return
+        return { evaluated: true, candleTime }
       }
       if (!prepared) {
         await this.#log(agent.id, 'SIGNAL_EVALUATED', 'info', '信号与当前持仓方向一致，无需下单', { candleTime, decision: 'NO_ACTION', position: agent.runtime.position })
+        await this.#markEvaluationCompleted(agent, candleTime)
         await this.#log(agent.id, 'COMPLETED', 'info', '闭合 K 线评估结束：NO_ACTION', { candleTime })
-        return
+        return { evaluated: true, candleTime }
       }
       await this.#dispatch(agent, prepared, signal.reason, candleTime)
+      await this.#markEvaluationCompleted(agent, candleTime)
+      return { evaluated: true, candleTime }
     } catch (error) {
-      await this.#log(agent.id, 'evaluation.failed', 'error', error instanceof Error ? error.message : '策略评估失败', { candleTime })
+      const message = error instanceof Error ? error.message : '策略评估失败'
+      agent.runtime = { ...agent.runtime, lastError: message, lastCheckAt: Date.now() }
+      agent.updatedAt = Date.now()
+      await this.#persistDefinitions()
+      await this.#log(agent.id, 'evaluation.failed', 'error', message, { candleTime })
+      return { evaluated: false, reason: 'error', candleTime, error: message }
     }
+  }
+
+  async #markEvaluationCompleted(agent, candleTime) {
+    agent.runtime = {
+      ...agent.runtime,
+      lastEvaluatedCandle: candleTime,
+      lastEvaluatedAt: Date.now(),
+      lastError: undefined,
+    }
+    agent.updatedAt = Date.now()
+    await this.#persistDefinitions()
   }
 
   #prepareOrder(agent, snapshot, signal, marketPrice, candleTime, position) {
@@ -575,11 +765,12 @@ export class AgentRuntime {
     if (this.isExecutionHalted()) throw new Error('风控总闸已关闭，订单被拒绝')
     const price = finiteNumber(order.marketPrice || order.price)
     const quantity = finiteNumber(order.quantity)
+    const closing = isClosingOrder(order)
     if (!(price > 0) || !(quantity > 0)) throw new Error('订单价格或数量无效')
-    if (quantity * price > finiteNumber(agent.risk.maxNotional, 100) + 1e-8 && !order.reduceOnly) throw new Error('订单名义价值超过 Agent 上限')
+    if (quantity * price > finiteNumber(agent.risk.maxNotional, 100) + 1e-8 && !closing) throw new Error('订单名义价值超过 Agent 上限')
     const snapshot = await this.getAccountSnapshot({ environment: agent.environment, marketType: agent.marketType, symbol: agent.symbol, markPrice: price })
     if (!(finiteNumber(snapshot.totalWalletBalance) > 0)) throw new Error('账户权益无效')
-    if (!order.reduceOnly && !(finiteNumber(snapshot.availableBalance) > 0)) throw new Error('账户可用余额不足')
+    if (!closing && !(finiteNumber(snapshot.availableBalance) > 0)) throw new Error('账户可用余额不足')
     if (agent.marketType === 'spot' && order.side === 'SELL') {
       const position = snapshot.portfolio?.find((item) => item.symbol === agent.symbol)
       if (!position || finiteNumber(position.quantity) + 1e-8 < quantity) throw new Error('现货 Agent 不允许裸卖空')

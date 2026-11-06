@@ -56,6 +56,8 @@ Binance 适配器覆盖：
 - 持久化 Paper 余额、持仓、订单、成本与合约配置
 - 现货账户、历史订单以及市价/限价订单
 - USDT 永续账户、非零持仓、历史订单以及市价/限价订单
+- 持仓表逐仓位平仓：现货卖出，单向合约使用反向 `BOTH + reduceOnly`，双向合约使用反向 `LONG / SHORT` 且不发送 `reduceOnly`
+- 现货平仓区分总持仓、可用和锁定数量；非 Paper 订单在主进程按 `LOT_SIZE / MARKET_LOT_SIZE / PRICE_FILTER / MIN_NOTIONAL / NOTIONAL` 规整并校验
 - 合约 `ONE_WAY / HEDGE` 持仓模式、`positionSide` 与 `reduceOnly` 语义
 - 全仓/逐仓、`1-125x` 杠杆以及逐仓保证金增减
 - `/fapi/v3/positionRisk` 标记价、强平价、初始/维持保证金与保证金率
@@ -67,7 +69,7 @@ Binance 适配器覆盖：
 
 ## Agent 运行时
 
-Agent 定义和 append-only 事件日志保存在 Electron 用户数据目录。运行时只对闭合 K 线求值，重启后所有 Agent 强制恢复为暂停状态。当前策略包括 EMA/SMA 交叉、Donchian、RSI、布林带和 ATR 突破。
+Agent 定义和 append-only 事件日志保存在 Electron 用户数据目录。运行时只对闭合 K 线求值；启动时立即检查最近一根已闭合 K 线，WebSocket 短暂断开时由 30 秒 REST 看门狗补偿。处于运行状态的 Agent 会在 Electron 重启后恢复订阅，暂停状态仍保持暂停。当前策略包括 EMA/SMA 交叉、Donchian、RSI、布林带和 ATR 突破。
 
 每次执行依次记录行情快照、信号、风控、意图、提交、交易所响应、成交结果、持仓对账和完成状态。Paper 与 Testnet 在风控通过后可自动执行；Live 只创建 30 秒有效的待确认意图，确认时重新获取价格并再次执行主进程风控。单向合约使用 `BOTH + reduceOnly`，双向合约按策略方向或已有反向仓派生 `LONG / SHORT`，且不会发送 Binance 禁止的 HEDGE `reduceOnly` 参数。
 
