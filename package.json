@@ -1,7 +1,7 @@
 {
   "name": "atlas-agent-os",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Desktop agent operating system for crypto trading",
   "author": "guoyuxin33",
   "main": "electron/main.mjs",
@@ -10,6 +10,8 @@
     "dev": "vite --host 0.0.0.0",
     "desktop:dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
     "build": "tsc -b && vite build",
+    "verify:paper": "node scripts/verify-paper-futures.mjs",
+    "verify:chat-sessions": "node scripts/verify-chat-sessions.mjs",
     "desktop:pack": "npm run build && electron-builder --dir",
     "desktop:dist": "npm run build && electron-builder",
     "lint": "eslint .",
@@ -17,11 +19,17 @@
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
+    "https-proxy-agent": "^7.0.6",
     "lightweight-charts": "latest",
     "lucide-react": "latest",
-    "vite": "latest",
     "react": "latest",
-    "react-dom": "latest"
+    "react-dom": "latest",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "technicalindicators": "^3.1.0",
+    "undici": "^6.29.1",
+    "vite": "latest",
+    "ws": "latest"
   },
   "devDependencies": {
     "@eslint/js": "latest",
@@ -55,15 +63,30 @@
     "mac": {
       "category": "public.app-category.finance",
       "icon": "build/icon.icns",
-      "target": ["dmg", "zip"],
+      "target": [
+        "dmg",
+        "zip"
+      ],
       "artifactName": "Atlas-Agent-OS-${version}-${arch}.${ext}"
     },
     "dmg": {
       "title": "Atlas Agent OS ${version}",
-      "window": { "width": 560, "height": 380 },
+      "window": {
+        "width": 560,
+        "height": 380
+      },
       "contents": [
-        { "x": 160, "y": 185, "type": "file" },
-        { "x": 400, "y": 185, "type": "link", "path": "/Applications" }
+        {
+          "x": 160,
+          "y": 185,
+          "type": "file"
+        },
+        {
+          "x": 400,
+          "y": 185,
+          "type": "link",
+          "path": "/Applications"
+        }
       ]
     }
   }

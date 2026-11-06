@@ -1,14 +1,10 @@
-import { useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Activity,
   AlertOctagon,
-  ArrowUpRight,
   Bell,
   Bot,
   BrainCircuit,
   Cable,
-  ChartCandlestick,
-  ChevronDown,
   ChevronRight,
   CircleDollarSign,
   Command,
@@ -16,55 +12,93 @@ import {
   Gauge,
   KeyRound,
   LayoutDashboard,
-  ListChecks,
   LockKeyhole,
   Menu,
   MessageSquareText,
-  MoreHorizontal,
+  Minus,
   Network,
-  Pause,
-  Play,
   Plus,
   Radio,
   ReceiptText,
+  RefreshCw,
   Search,
   Settings2,
   ShieldCheck,
   SlidersHorizontal,
-  SquareActivity,
   Unplug,
   WalletCards,
+  Wrench,
   X,
   Zap,
 } from 'lucide-react'
+import { AgentCreateModal, AgentsView, OverviewAgentsPanel } from './components/AgentsView'
+import { AssistantView } from './components/AssistantView'
+import { CommandPalette } from './components/CommandPalette'
 import { MarketChart } from './components/MarketChart'
+import { MarketSelector } from './components/MarketSelector'
 import { Modal } from './components/Modal'
-import { activity, agents as initialAgents, positions, riskRules, type Agent } from './data'
-import { useBinanceTicker } from './hooks/useBinanceTicker'
-import { saveSecrets } from './lib/desktop'
+import { OrdersView, ReviewView, StrategiesView } from './components/OperationsViews'
+import { SkillsView } from './components/SkillsView'
+import { riskRules } from './data'
+import { useMarketData } from './hooks/useMarketData'
+import { getVaultStatus, saveSecrets } from './lib/desktop'
+import { getModelProvider, modelProviders } from './modelProviders'
+import { builtInSkills } from './skills'
+import type { AccountSnapshot, AgentCreateInput, AgentDefinition, AgentEvent, AgentIntent, Environment, McpConnection, MarketBook, MarketInterval, MarketTick, MarketType, PortfolioPosition, TradingOrder } from './types'
 
-type NavId = 'overview' | 'agents' | 'strategies' | 'connections' | 'risk' | 'orders' | 'review'
-type ModalId = 'exchange' | 'model' | 'agent' | 'emergency' | 'notifications' | null
+type NavId = 'overview' | 'assistant' | 'agents' | 'strategies' | 'skills' | 'connections' | 'risk' | 'orders' | 'review'
+type ModalId = 'exchange' | 'model' | 'network' | 'agent' | 'emergency' | 'notifications' | null
 
-const navigation: Array<{ id: NavId; label: string; icon: typeof LayoutDashboard }> = [
-  { id: 'overview', label: '工作台', icon: LayoutDashboard },
-  { id: 'agents', label: 'Agent', icon: Bot },
-  { id: 'strategies', label: '策略库', icon: BrainCircuit },
-  { id: 'connections', label: '连接', icon: Cable },
-  { id: 'risk', label: '风控', icon: ShieldCheck },
-  { id: 'orders', label: '订单', icon: ReceiptText },
-  { id: 'review', label: '复盘', icon: FileClock },
+const navigation: Array<{ id: NavId; label: string; icon: typeof LayoutDashboard; group: 'run' | 'control' }> = [
+  { id: 'overview', label: '工作台', icon: LayoutDashboard, group: 'run' },
+  { id: 'assistant', label: 'AI 助手', icon: MessageSquareText, group: 'run' },
+  { id: 'agents', label: 'Agent', icon: Bot, group: 'run' },
+  { id: 'strategies', label: '策略库', icon: BrainCircuit, group: 'run' },
+  { id: 'skills', label: 'Skill / MCP', icon: Wrench, group: 'run' },
+  { id: 'connections', label: '连接', icon: Cable, group: 'control' },
+  { id: 'risk', label: '风控', icon: ShieldCheck, group: 'control' },
+  { id: 'orders', label: '订单与持仓', icon: ReceiptText, group: 'control' },
+  { id: 'review', label: '复盘', icon: FileClock, group: 'control' },
 ]
 
+const intervals: MarketInterval[] = ['1m', '5m', '15m', '1h', '4h', '1d']
+function environmentLabel(environment: Environment) {
+  return environment === 'paper' ? '模拟盘' : environment === 'testnet' ? '测试网' : '生产'
+}
+
 function formatPrice(value: number) {
-  return new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value)
+  if (!(value > 0)) return '--'
+  const digits = value < 1 ? 6 : value < 100 ? 4 : 2
+  return new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: digits }).format(value)
 }
 
-function StatusDot({ live = false }: { live?: boolean }) {
-  return <span className={`status-dot ${live ? 'status-dot-live' : ''}`} />
+function formatQuantity(value: number) {
+  if (!(value > 0)) return '--'
+  return new Intl.NumberFormat('en-US', { maximumFractionDigits: 6 }).format(value)
 }
 
-function Sidebar({ active, onNavigate, open, onClose }: { active: NavId; onNavigate: (id: NavId) => void; open: boolean; onClose: () => void }) {
+function StatusDot({ live = false, danger = false }: { live?: boolean; danger?: boolean }) {
+  return <span className={`status-dot ${live ? 'status-dot-live' : ''} ${danger ? 'status-dot-danger' : ''}`} />
+}
+
+function Sidebar({ active, onNavigate, open, onClose, environment, binanceConfigured, modelConfigured, agentCount }: {
+  active: NavId
+  onNavigate: (id: NavId) => void
+  open: boolean
+  onClose: () => void
+  environment: Environment
+  binanceConfigured: boolean
+  modelConfigured: boolean
+  agentCount: number
+}) {
+  const renderGroup = (group: 'run' | 'control') => navigation.filter((item) => item.group === group).map((item) => (
+    <button key={item.id} className={`nav-item ${active === item.id ? 'nav-item-active' : ''}`} onClick={() => { onNavigate(item.id); onClose() }}>
+      <item.icon size={17} />
+      <span>{item.label}</span>
+      {item.id === 'agents' && <span className="nav-count">{agentCount}</span>}
+    </button>
+  ))
+
   return (
     <aside className={`sidebar ${open ? 'sidebar-open' : ''}`}>
       <div className="brand-row">
@@ -73,44 +107,22 @@ function Sidebar({ active, onNavigate, open, onClose }: { active: NavId; onNavig
         <span className="brand-edition">Agent OS</span>
         <button className="mobile-close" onClick={onClose} aria-label="关闭导航"><X size={18} /></button>
       </div>
-
       <nav className="nav-list" aria-label="主导航">
         <p className="nav-label">运行中心</p>
-        {navigation.slice(0, 4).map((item) => (
-          <button
-            key={item.id}
-            className={`nav-item ${active === item.id ? 'nav-item-active' : ''}`}
-            onClick={() => { onNavigate(item.id); onClose() }}
-          >
-            <item.icon size={17} />
-            <span>{item.label}</span>
-            {item.id === 'agents' && <span className="nav-count">3</span>}
-          </button>
-        ))}
-
+        {renderGroup('run')}
         <p className="nav-label nav-label-spaced">控制与记录</p>
-        {navigation.slice(4).map((item) => (
-          <button
-            key={item.id}
-            className={`nav-item ${active === item.id ? 'nav-item-active' : ''}`}
-            onClick={() => { onNavigate(item.id); onClose() }}
-          >
-            <item.icon size={17} />
-            <span>{item.label}</span>
-          </button>
-        ))}
+        {renderGroup('control')}
       </nav>
-
       <div className="sidebar-spacer" />
       <div className="account-block">
         <div className="account-line">
           <span className="exchange-logo">BN</span>
-          <div><strong>Binance Testnet</strong><span><StatusDot live /> 已连接</span></div>
-          <MoreHorizontal size={17} />
+          <div><strong>Binance · {environmentLabel(environment)}</strong><span><StatusDot live={environment === 'paper' || binanceConfigured} danger={environment === 'live' && !binanceConfigured} />{environment === 'paper' ? '本地撮合' : binanceConfigured ? '凭证已配置' : '等待配置'}</span></div>
+          <WalletCards size={17} />
         </div>
         <div className="account-line model-line">
           <span className="model-logo"><Command size={15} /></span>
-          <div><strong>CCSwitch Router</strong><span>Claude Sonnet 4.5</span></div>
+          <div><strong>模型路由</strong><span>{modelConfigured ? 'OpenAI 兼容接口已配置' : '等待配置'}</span></div>
           <ChevronRight size={16} />
         </div>
       </div>
@@ -119,336 +131,665 @@ function Sidebar({ active, onNavigate, open, onClose }: { active: NavId; onNavig
   )
 }
 
-function Topbar({ onMenu, onModal }: { onMenu: () => void; onModal: (id: ModalId) => void }) {
+function Topbar({ environment, marketType, onEnvironment, onMarketType, onMenu, onModal, onSearch, onAccount }: {
+  environment: Environment
+  marketType: MarketType
+  onEnvironment: (value: Environment) => void
+  onMarketType: (value: MarketType) => void
+  onMenu: () => void
+  onModal: (id: ModalId) => void
+  onSearch: () => void
+  onAccount: () => void
+}) {
   return (
     <header className="topbar">
       <button className="menu-button" onClick={onMenu} aria-label="打开导航"><Menu size={19} /></button>
-      <div className="command-search">
-        <Search size={16} />
-        <span>搜索 Agent、市场或订单</span>
-        <kbd>⌘ K</kbd>
-      </div>
-      <div className="topbar-actions">
-        <button className="testnet-chip"><StatusDot live /> 模拟盘</button>
-        <button className="icon-button notification-button" onClick={() => onModal('notifications')} aria-label="通知">
-          <Bell size={18} /><span />
-        </button>
-        <button className="avatar-button" aria-label="账户菜单">YX</button>
-      </div>
+      <button className="command-search" onClick={onSearch}><Search size={16} /><span>搜索页面或操作</span><kbd>⌘ K</kbd></button>
+      <div className="topbar-mode segmented compact" aria-label="市场类型"><button className={marketType === 'spot' ? 'active' : ''} onClick={() => onMarketType('spot')}>现货</button><button className={marketType === 'futures' ? 'active' : ''} onClick={() => onMarketType('futures')}>永续</button></div>
+      <div className="environment-switch segmented compact" aria-label="账户环境">{(['paper', 'testnet', 'live'] as Environment[]).map((value) => <button key={value} className={`${environment === value ? 'active' : ''} ${value === 'live' ? 'live-mode' : ''}`} onClick={() => onEnvironment(value)}>{environmentLabel(value)}</button>)}</div>
+      <div className="topbar-actions"><button className="icon-button notification-button" onClick={() => onModal('notifications')} aria-label="通知"><Bell size={18} /><span /></button><button className="avatar-button" onClick={onAccount} aria-label="账户菜单">YX</button></div>
     </header>
   )
 }
 
 function Metric({ label, value, detail, tone }: { label: string; value: string; detail: string; tone?: 'positive' | 'negative' | 'accent' }) {
-  return (
-    <div className="metric">
-      <span>{label}</span>
-      <strong className={tone ? `text-${tone}` : ''}>{value}</strong>
-      <small>{detail}</small>
-    </div>
-  )
+  return <div className="metric"><span>{label}</span><strong className={tone ? `text-${tone}` : ''}>{value}</strong><small>{detail}</small></div>
 }
 
-function AgentRow({ agent, onToggle }: { agent: Agent; onToggle: (id: string) => void }) {
-  const running = agent.status === 'running'
-  return (
-    <div className="agent-row">
-      <div className={`agent-icon agent-icon-${agent.id}`}><Bot size={17} /></div>
-      <div className="agent-main">
-        <div><strong>{agent.name}</strong><span className={`agent-state state-${agent.status}`}><StatusDot live={running} />{running ? '运行中' : agent.status === 'observing' ? '观察中' : '已暂停'}</span></div>
-        <span>{agent.market} · {agent.strategy}</span>
-      </div>
-      <div className="agent-allocation"><span>资金占用</span><strong>{agent.allocation}%</strong></div>
-      <div className={`agent-pnl ${agent.pnl >= 0 ? 'text-positive' : 'text-negative'}`}>
-        <span>今日</span><strong>{agent.pnl >= 0 ? '+' : ''}{agent.pnl.toFixed(2)}%</strong>
-      </div>
-      <button className="icon-button" onClick={() => onToggle(agent.id)} aria-label={running ? `暂停${agent.name}` : `运行${agent.name}`}>
-        {running ? <Pause size={16} /> : <Play size={16} />}
-      </button>
-    </div>
-  )
+function PortfolioTable({ positions, updatedAt }: { positions: PortfolioPosition[]; updatedAt?: number }) {
+  const money = (value: string) => {
+    const number = Number(value)
+    if (!Number.isFinite(number)) return '--'
+    return `$${number === 0 ? '0.00' : formatPrice(Math.abs(number))}`
+  }
+  const signedMoney = (value: string) => {
+    const number = Number(value)
+    if (!Number.isFinite(number)) return '--'
+    return `${number >= 0 ? '+' : '-'}${money(String(number))}`
+  }
+  const quantity = (value: string) => Number(value).toLocaleString('en-US', { maximumFractionDigits: 8 })
+  const riskValue = (value?: string) => Number(value) > 0 ? money(value || '0') : '--'
+
+  return <section className="panel portfolio-panel"><header className="panel-header"><div><h2>当前持仓与实时收益</h2><p>标记价、保证金率和强平价随账户快照更新</p></div><span className="portfolio-updated"><StatusDot live />{updatedAt ? new Date(updatedAt).toLocaleTimeString('zh-CN', { hour12: false }) : '等待同步'}</span></header>{positions.length ? <div className="portfolio-table-scroll"><div className="portfolio-table"><div className="portfolio-row portfolio-head"><span>交易对</span><span>市场 / 方向</span><span>数量</span><span>成本 / 标记</span><span>名义价值</span><span>初始 / 维持保证金</span><span>强平价 / 保证金率</span><span>未实现盈亏</span><span>收益率</span></div>{positions.map((position) => { const pnl = Number(position.unrealizedPnl); const rate = Number(position.returnRate); const marginRatio = Number(position.marginRatio); const tone = pnl >= 0 ? 'text-positive' : 'text-negative'; return <div className="portfolio-row" key={`${position.marketType}:${position.symbol}:${position.positionSide || position.side}`}><strong>{position.symbol.replace('USDT', '/USDT')}</strong><span>{position.marketType === 'spot' ? '现货' : `${position.leverage}x ${position.marginType === 'ISOLATED' ? '逐仓' : '全仓'}`} · <i className={position.side === 'LONG' ? 'text-positive' : 'text-negative'}>{position.side === 'LONG' ? '多' : '空'}</i></span><span>{quantity(position.quantity)}</span><span>{position.entryPrice ? money(position.entryPrice) : '--'}<small>标记 {money(position.markPrice)}</small></span><span>{money(position.marketValue)}</span><span>{riskValue(position.initialMargin)}<small>维持 {riskValue(position.maintMargin)}</small></span><span>{riskValue(position.liquidationPrice)}<small>{Number.isFinite(marginRatio) && position.marketType === 'futures' ? `保证金率 ${marginRatio.toFixed(2)}%${position.liquidationPriceEstimated ? ' · 估算' : ''}` : '--'}</small></span><strong className={tone}>{signedMoney(position.unrealizedPnl)}</strong><strong className={rate >= 0 ? 'text-positive' : 'text-negative'}>{rate >= 0 ? '+' : ''}{rate.toFixed(2)}% <small>{position.returnBasis === '24h' ? '24h' : position.returnBasis === 'margin' ? '保证金' : '成本'}</small></strong></div> })}</div></div> : <div className="portfolio-empty"><WalletCards size={22} /><div><strong>当前市场还没有持仓</strong><p>在模拟盘提交买入或合约开仓后，会在这里显示成本价、实时盈亏、保证金率和强平价</p></div></div>}</section>
 }
 
-function Overview({ onModal, halted, agents, onToggleAgent, onToast }: {
-  onModal: (id: ModalId) => void
+function Overview({ environment, marketType, symbol, interval, account, tick, book, halted, agents, agentLogs, agentsLoading, busyAgentIds, onSymbol, onInterval, onModal, onToggleAgent, onManageAgents, onPlaceOrder, onRefreshAccount, onToast }: {
+  environment: Environment
+  marketType: MarketType
+  symbol: string
+  interval: MarketInterval
+  account: AccountSnapshot | null
+  tick: MarketTick
+  book: MarketBook
   halted: boolean
-  agents: Agent[]
-  onToggleAgent: (id: string) => void
+  agents: AgentDefinition[]
+  agentLogs: AgentEvent[]
+  agentsLoading: boolean
+  busyAgentIds: Set<string>
+  onSymbol: (value: string) => void
+  onInterval: (value: MarketInterval) => void
+  onModal: (id: ModalId) => void
+  onToggleAgent: (agent: AgentDefinition) => Promise<void>
+  onManageAgents: () => void
+  onPlaceOrder: (order: TradingOrder) => Promise<void>
+  onRefreshAccount: () => Promise<void>
   onToast: (message: string) => void
 }) {
-  const tick = useBinanceTicker()
-  const [orderSide, setOrderSide] = useState<'buy' | 'sell'>('buy')
-  const [orderType, setOrderType] = useState<'market' | 'limit'>('limit')
-  const [amount, setAmount] = useState('0.008')
+  const [orderSide, setOrderSide] = useState<'BUY' | 'SELL'>('BUY')
+  const [orderType, setOrderType] = useState<'MARKET' | 'LIMIT'>('LIMIT')
+  const [amount, setAmount] = useState('')
+  const [price, setPrice] = useState('')
+  const [showMA, setShowMA] = useState(true)
+  const [reduceOnly, setReduceOnly] = useState(false)
+  const [positionSide, setPositionSide] = useState<'LONG' | 'SHORT'>('LONG')
+  const [submitting, setSubmitting] = useState(false)
+  const [configuringFutures, setConfiguringFutures] = useState(false)
+  const [marginAmount, setMarginAmount] = useState('')
+  const futuresConfig = account?.futuresConfig
+  const positionMode = futuresConfig?.positionMode || 'ONE_WAY'
+  const configuredLeverage = Number(futuresConfig?.leverage || 3)
+  const leverageDraftKey = `${symbol}:${configuredLeverage}`
+  const [leverageDraft, setLeverageDraft] = useState({ key: leverageDraftKey, value: String(configuredLeverage) })
+  const leverageInput = leverageDraft.key === leverageDraftKey ? leverageDraft.value : String(configuredLeverage)
+  const setLeverageInput = (value: string) => setLeverageDraft({ key: leverageDraftKey, value })
+  const leverage = Math.max(1, Number(futuresConfig?.leverage || leverageInput || 1))
+  const effectivePrice = orderType === 'MARKET' ? tick.price : Number(price)
+  const estimated = useMemo(() => Number(amount || 0) * effectivePrice, [amount, effectivePrice])
+  const livePortfolio = useMemo(() => (account?.portfolio || []).map((position) => {
+    if (!tick.connected || tick.symbol !== position.symbol || position.returnBasis === '24h') return position
+    const entryPrice = Number(position.entryPrice)
+    const quantity = Number(position.quantity)
+    const leverage = Math.max(1, Number(position.leverage || 1))
+    if (!(entryPrice > 0) || !(quantity > 0)) return position
+    const direction = position.side === 'SHORT' ? -1 : 1
+    const unrealizedPnl = (tick.price - entryPrice) * quantity * direction
+    const cost = entryPrice * quantity / leverage
+    return { ...position, markPrice: String(tick.price), marketValue: String(tick.price * quantity), unrealizedPnl: String(unrealizedPnl), unrealizedProfit: String(unrealizedPnl), returnRate: String(cost > 0 ? unrealizedPnl / cost * 100 : 0) }
+  }), [account?.portfolio, tick.connected, tick.price, tick.symbol])
+  const livePnlDelta = useMemo(() => livePortfolio.reduce((sum, position, index) => sum + Number(position.unrealizedPnl || 0) - Number(account?.portfolio[index]?.unrealizedPnl || 0), 0), [account?.portfolio, livePortfolio])
+  const selectedFuturesPosition = livePortfolio.find((position) => position.marketType === 'futures' && position.symbol === symbol && (positionMode === 'ONE_WAY' || position.positionSide === positionSide))
+  const balance = Number(account?.availableBalance || 0)
+  const pnl = Number(account?.todayPnl || 0) + livePnlDelta
+  const equity = Number(account?.totalWalletBalance || account?.availableBalance || 0) + livePnlDelta
+  const baseAsset = symbol.replace(/USDT$/, '')
 
-  const estimated = useMemo(() => Number(amount || 0) * tick.price, [amount, tick.price])
+  const applyPreset = (ratio: number) => {
+    const baseBalance = Number(account?.balances.find((item) => item.asset === baseAsset)?.free || 0)
+    const quantity = marketType === 'spot' && orderSide === 'SELL'
+      ? baseBalance * ratio
+      : (balance * ratio * (marketType === 'futures' ? leverage : 1)) / Math.max(effectivePrice, 1)
+    setAmount(quantity > 0 ? quantity.toFixed(symbol.startsWith('BTC') ? 6 : 4) : '0')
+  }
 
-  const placeOrder = () => {
-    if (halted) {
-      onToast('风控总闸已关闭，订单未提交')
-      return
+  const futuresMutationOptions = () => {
+    if (environment !== 'live') return { environment, symbol }
+    const confirmed = window.confirm(`确认调整 Binance 生产账户的 ${symbol} 合约参数？该操作会立即生效。`)
+    return confirmed ? { environment, symbol, confirmation: 'LIVE_ACCOUNT_CONFIRMED' as const } : null
+  }
+
+  const runFuturesMutation = async (mutation: (options: { environment: Environment; symbol: string; confirmation?: 'LIVE_ACCOUNT_CONFIRMED' }) => Promise<unknown>, success: string) => {
+    if (!window.atlas || configuringFutures) return
+    const options = futuresMutationOptions()
+    if (!options) return
+    setConfiguringFutures(true)
+    try {
+      await mutation(options)
+      await onRefreshAccount()
+      onToast(success)
+    } catch (caught) {
+      onToast(caught instanceof Error ? caught.message : '合约参数更新失败')
+    } finally {
+      setConfiguringFutures(false)
     }
-    onToast(`模拟订单已进入风控队列 · ${orderSide === 'buy' ? '买入' : '卖出'} ${amount} BTC`)
+  }
+
+  const updateLeverage = () => {
+    const nextLeverage = Math.round(Number(leverageInput))
+    if (nextLeverage < 1 || nextLeverage > 125) return onToast('杠杆必须在 1x 到 125x 之间')
+    return runFuturesMutation(
+      (options) => window.atlas!.binance.setFuturesLeverage({ ...options, leverage: nextLeverage }),
+      `${symbol} 杠杆已更新为 ${nextLeverage}x`,
+    )
+  }
+
+  const updateMarginType = (marginType: 'CROSSED' | 'ISOLATED') => runFuturesMutation(
+    (options) => window.atlas!.binance.setFuturesMarginType({ ...options, marginType }),
+    `${symbol} 已切换为${marginType === 'ISOLATED' ? '逐仓' : '全仓'}`,
+  )
+
+  const updatePositionMode = (nextMode: 'ONE_WAY' | 'HEDGE') => {
+    setReduceOnly(false)
+    setPositionSide('LONG')
+    return runFuturesMutation(
+      (options) => window.atlas!.binance.setFuturesPositionMode({ ...options, positionMode: nextMode }),
+      `持仓模式已切换为${nextMode === 'HEDGE' ? '双向持仓' : '单向持仓'}`,
+    )
+  }
+
+  const adjustMargin = (action: 'ADD' | 'REMOVE') => {
+    const amountValue = Number(marginAmount)
+    if (!(amountValue > 0)) return onToast('请输入有效的保证金金额')
+    return runFuturesMutation(
+      (options) => window.atlas!.binance.adjustFuturesMargin({ ...options, amount: amountValue, action, positionSide: positionMode === 'HEDGE' ? positionSide : 'BOTH' }),
+      `${symbol} 逐仓保证金已${action === 'ADD' ? '增加' : '减少'} ${amountValue.toFixed(2)} USDT`,
+    )
+  }
+
+  const futuresActionLabel = positionMode === 'HEDGE'
+    ? positionSide === 'LONG'
+      ? orderSide === 'BUY' ? '开多' : '平多'
+      : orderSide === 'SELL' ? '开空' : '平空'
+    : reduceOnly
+      ? orderSide === 'BUY' ? '平空' : '平多'
+      : orderSide === 'BUY' ? '做多' : '做空'
+
+  const placeOrder = async () => {
+    if (halted) return onToast('风控总闸已关闭，订单未提交')
+    if (!tick.connected) return onToast('等待所选交易对的真实实时行情后再下单')
+    if (!(Number(amount) > 0)) return onToast('请输入有效的下单数量')
+    if (orderType === 'LIMIT' && !(Number(price) > 0)) return onToast('限价单必须明确输入委托价格')
+    setSubmitting(true)
+    try {
+      await onPlaceOrder({ environment, marketType, symbol, side: orderSide, type: orderType, quantity: amount, price: orderType === 'LIMIT' ? price : undefined, marketPrice: String(tick.price), positionSide: marketType === 'futures' ? positionMode === 'HEDGE' ? positionSide : 'BOTH' : undefined, reduceOnly: marketType === 'futures' && positionMode === 'ONE_WAY' ? reduceOnly : undefined, leverage: marketType === 'futures' ? leverage : undefined, marginType: marketType === 'futures' ? futuresConfig?.marginType || 'CROSSED' : undefined, clientOrderId: crypto.randomUUID().replaceAll('-', '').slice(0, 32) })
+    } finally { setSubmitting(false) }
   }
 
   return (
     <main className="page overview-page">
-      <section className="page-heading">
-        <div>
-          <div className="heading-eyebrow"><StatusDot live={!halted} /> {halted ? '所有执行已停止' : '系统运行正常'}<span>最后检查 8 秒前</span></div>
-          <h1>交易工作台</h1>
-          <p>Agent 正在监控 12 个市场，所有订单均经过风控闸门</p>
-        </div>
-        <div className="heading-actions">
-          <button className="secondary-button" onClick={() => onModal('exchange')}><Cable size={16} />连接交易所</button>
-          <button className="primary-button" onClick={() => onModal('agent')}><Plus size={16} />新建 Agent</button>
-        </div>
-      </section>
-
-      <section className="metrics-strip">
-        <Metric label="账户净值" value="$24,892.40" detail="模拟盘资金" />
-        <Metric label="今日盈亏" value="+$482.16" detail="+1.98% vs 00:00" tone="positive" />
-        <Metric label="当前敞口" value="$2,837.20" detail="净值的 11.4%" tone="accent" />
-        <Metric label="运行中 Agent" value={halted ? '0 / 3' : '1 / 3'} detail={halted ? '总闸已关闭' : '1 个等待信号'} />
-      </section>
-
+      <section className="page-heading"><div><div className="heading-eyebrow"><StatusDot live={!halted} />{halted ? '所有执行已停止' : '系统运行正常'}<span>{environmentLabel(environment)} · {marketType === 'spot' ? '现货' : 'USDT 永续'}</span></div><h1>交易工作台</h1><p>共享 WebSocket 行情、账户收益和订单执行在同一条风险边界内</p></div><div className="heading-actions"><button className="secondary-button" onClick={() => onModal('exchange')}><Cable size={16} />连接交易所</button><button className="primary-button" onClick={() => onModal('agent')}><Plus size={16} />新建 Agent</button></div></section>
+      <section className="metrics-strip"><Metric label="账户权益" value={`$${equity.toLocaleString('en-US', { maximumFractionDigits: 2 })}`} detail={account?.source === 'binance' ? 'Binance 实时账户' : '本地模拟资金'} /><Metric label="今日盈亏" value={`${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`} detail={`未实现盈亏 ${Number(account?.unrealizedPnl || 0).toFixed(2)}`} tone={pnl >= 0 ? 'positive' : 'negative'} /><Metric label="可用余额" value={`$${balance.toLocaleString('en-US', { maximumFractionDigits: 2 })}`} detail={`${account?.positions.length || 0} 个合约持仓`} tone="accent" /><Metric label="运行中 Agent" value={`${halted ? 0 : agents.filter((agent) => agent.status === 'running').length} / ${agents.length}`} detail={halted ? '总闸已关闭' : '逐笔通过风险规则'} /></section>
       <section className="dashboard-grid">
-        <article className="panel market-panel">
-          <header className="panel-header market-header">
-            <div className="market-title">
-              <span className="asset-mark">₿</span>
-              <div><strong>BTC / USDT</strong><span>现货 · Binance</span></div>
-              <button className="bare-button" aria-label="切换市场"><ChevronDown size={15} /></button>
-            </div>
-            <div className="market-price">
-              <strong>${formatPrice(tick.price)}</strong>
-              <span className={tick.change >= 0 ? 'text-positive' : 'text-negative'}>{tick.change >= 0 ? '+' : ''}{tick.change.toFixed(2)}%</span>
-            </div>
-            <div className="market-stat"><span>24h 高</span><strong>{formatPrice(tick.high)}</strong></div>
-            <div className="market-stat"><span>24h 低</span><strong>{formatPrice(tick.low)}</strong></div>
-            <div className="market-connection"><StatusDot live={tick.connected} />{tick.connected ? '实时' : '重连中'}</div>
-          </header>
-          <div className="chart-toolbar">
-            <div className="segmented compact"><button className="active">15m</button><button>1h</button><button>4h</button><button>1D</button></div>
-            <button className="bare-button"><SlidersHorizontal size={15} />指标</button>
-          </div>
-          <MarketChart />
-        </article>
-
+        <article className="panel market-panel"><header className="panel-header market-header"><div className="market-title"><span className="asset-mark">{baseAsset.slice(0, 1)}</span><div><MarketSelector marketType={marketType} value={symbol} onChange={onSymbol} /><span>{marketType === 'spot' ? '现货' : 'USDT 永续'} · Binance</span></div></div><div className="market-price"><strong>{tick.price > 0 ? `$${formatPrice(tick.price)}` : '--'}</strong><span className={tick.change >= 0 ? 'text-positive' : 'text-negative'}>{tick.connected ? `${tick.change >= 0 ? '+' : ''}${tick.change.toFixed(2)}%` : '等待行情'}</span></div><div className="market-stat"><span>24h 高</span><strong>{formatPrice(tick.high)}</strong></div><div className="market-stat"><span>24h 低</span><strong>{formatPrice(tick.low)}</strong></div><div className="market-connection"><StatusDot live={tick.connected} />{tick.connected ? '实时' : '重连中'}</div></header><div className="chart-toolbar"><div className="segmented compact">{intervals.map((item) => <button key={item} className={interval === item ? 'active' : ''} onClick={() => onInterval(item)}>{item === '1d' ? '1D' : item}</button>)}</div><div className="chart-market-tools"><div className="best-book" aria-label={`${symbol} 最优买卖盘口`}><span><i>买一</i><strong className="text-positive">{formatPrice(book.bid)}</strong><small>{formatQuantity(book.bidSize)} {baseAsset}</small></span><span><i>卖一</i><strong className="text-negative">{formatPrice(book.ask)}</strong><small>{formatQuantity(book.askSize)} {baseAsset}</small></span></div><button className={`bare-button ${showMA ? 'indicator-active' : ''}`} onClick={() => setShowMA((value) => !value)}><SlidersHorizontal size={15} />MA20</button></div></div><MarketChart marketType={marketType} symbol={symbol} interval={interval} showMA={showMA} /></article>
         <aside className="panel order-panel">
-          <header className="panel-header"><div><h2>快速下单</h2><p>提交后先进入风控队列</p></div><LockKeyhole size={17} /></header>
-          <div className="segmented order-side"><button className={orderSide === 'buy' ? 'active buy-active' : ''} onClick={() => setOrderSide('buy')}>买入</button><button className={orderSide === 'sell' ? 'active sell-active' : ''} onClick={() => setOrderSide('sell')}>卖出</button></div>
+          <header className="panel-header"><div><h2>快速下单</h2><p>{environmentLabel(environment)} · {marketType === 'spot' ? '现货' : '永续合约'}</p></div><LockKeyhole size={17} /></header>
+          <div className="segmented order-side"><button className={orderSide === 'BUY' ? 'active buy-active' : ''} onClick={() => setOrderSide('BUY')}>{marketType === 'spot' ? '买入' : positionMode === 'HEDGE' ? positionSide === 'LONG' ? '开多' : '平空' : reduceOnly ? '平空' : '做多'}</button><button className={orderSide === 'SELL' ? 'active sell-active' : ''} onClick={() => setOrderSide('SELL')}>{marketType === 'spot' ? '卖出' : positionMode === 'HEDGE' ? positionSide === 'LONG' ? '平多' : '开空' : reduceOnly ? '平多' : '做空'}</button></div>
           <label className="field-label">订单类型</label>
-          <div className="segmented order-type"><button className={orderType === 'limit' ? 'active' : ''} onClick={() => setOrderType('limit')}>限价</button><button className={orderType === 'market' ? 'active' : ''} onClick={() => setOrderType('market')}>市价</button></div>
+          <div className="segmented order-type"><button className={orderType === 'LIMIT' ? 'active' : ''} onClick={() => setOrderType('LIMIT')}>限价</button><button className={orderType === 'MARKET' ? 'active' : ''} onClick={() => setOrderType('MARKET')}>市价</button></div>
+          {marketType === 'futures' && (
+            <div className="futures-controls">
+              <div className="futures-control-row">
+                <span>持仓模式</span>
+                <div className="segmented compact">
+                  <button disabled={configuringFutures} className={positionMode === 'ONE_WAY' ? 'active' : ''} onClick={() => updatePositionMode('ONE_WAY')}>单向</button>
+                  <button disabled={configuringFutures} className={positionMode === 'HEDGE' ? 'active' : ''} onClick={() => updatePositionMode('HEDGE')}>双向</button>
+                </div>
+              </div>
+              {positionMode === 'HEDGE' && <div className="futures-control-row">
+                <span>仓位方向</span>
+                <div className="segmented compact">
+                  <button className={positionSide === 'LONG' ? 'active buy-active' : ''} onClick={() => { setPositionSide('LONG'); setOrderSide('BUY') }}>多仓 LONG</button>
+                  <button className={positionSide === 'SHORT' ? 'active sell-active' : ''} onClick={() => { setPositionSide('SHORT'); setOrderSide('SELL') }}>空仓 SHORT</button>
+                </div>
+              </div>}
+              <div className="futures-control-row">
+                <span>保证金模式</span>
+                <div className="segmented compact">
+                  <button disabled={configuringFutures} className={futuresConfig?.marginType !== 'ISOLATED' ? 'active' : ''} onClick={() => updateMarginType('CROSSED')}>全仓</button>
+                  <button disabled={configuringFutures} className={futuresConfig?.marginType === 'ISOLATED' ? 'active' : ''} onClick={() => updateMarginType('ISOLATED')}>逐仓</button>
+                </div>
+              </div>
+              <div className="futures-control-row">
+                <label htmlFor="leverage">杠杆</label>
+                <div className="leverage-stepper">
+                  <button type="button" aria-label="降低杠杆" onClick={() => setLeverageInput(String(Math.max(1, Number(leverageInput || 1) - 1)))}><Minus size={13} /></button>
+                  <input id="leverage" type="number" min="1" max="125" value={leverageInput} onChange={(event) => setLeverageInput(event.target.value)} />
+                  <span>x</span>
+                  <button type="button" aria-label="提高杠杆" onClick={() => setLeverageInput(String(Math.min(125, Number(leverageInput || 1) + 1)))}><Plus size={13} /></button>
+                  <button type="button" className="apply-leverage" disabled={configuringFutures || Number(leverageInput) === futuresConfig?.leverage} onClick={updateLeverage}>应用</button>
+                </div>
+              </div>
+              {futuresConfig?.marginType === 'ISOLATED' && selectedFuturesPosition && (
+                <div className="isolated-margin-control">
+                  <div><span>{positionMode === 'HEDGE' ? `${positionSide} 逐仓保证金` : '逐仓保证金'}</span><strong>{Number(selectedFuturesPosition.isolatedMargin || futuresConfig.isolatedMargin || 0).toFixed(2)} USDT</strong></div>
+                  <div className="isolated-margin-actions"><input value={marginAmount} onChange={(event) => setMarginAmount(event.target.value)} inputMode="decimal" placeholder="金额" /><button disabled={configuringFutures} onClick={() => adjustMargin('ADD')}>增加</button><button disabled={configuringFutures} onClick={() => adjustMargin('REMOVE')}>减少</button></div>
+                </div>
+              )}
+              {positionMode === 'ONE_WAY' && <label className="reduce-only-control"><span><ShieldCheck size={14} />只减仓</span><span className="switch"><input type="checkbox" checked={reduceOnly} onChange={(event) => setReduceOnly(event.target.checked)} /><span /></span></label>}
+            </div>
+          )}
           <label className="field-label" htmlFor="price">委托价格</label>
-          <div className={`input-shell ${orderType === 'market' ? 'input-disabled' : ''}`}><input id="price" disabled={orderType === 'market'} defaultValue={formatPrice(tick.price)} /><span>USDT</span></div>
+          <div className={`input-shell ${orderType === 'MARKET' ? 'input-disabled' : ''}`}><input id="price" disabled={orderType === 'MARKET'} value={price} placeholder={formatPrice(tick.price)} onChange={(event) => setPrice(event.target.value)} inputMode="decimal" /><span>USDT</span></div>
           <label className="field-label" htmlFor="amount">数量</label>
-          <div className="input-shell"><input id="amount" value={amount} onChange={(event) => setAmount(event.target.value)} inputMode="decimal" /><span>BTC</span></div>
-          <div className="amount-presets"><button>25%</button><button>50%</button><button>75%</button><button>最大</button></div>
-          <div className="order-summary"><span>预计金额</span><strong>${estimated.toFixed(2)}</strong><span>预计手续费</span><strong>$0.43</strong></div>
-          <div className={`risk-gate ${halted ? 'risk-gate-closed' : ''}`}>
-            <ShieldCheck size={17} />
-            <div><strong>{halted ? '风控闸门已关闭' : '风控闸门待命'}</strong><span>{halted ? '所有订单将被拒绝' : '下单时检查 8 项规则'}</span></div>
-          </div>
-          <button className={`order-button order-${orderSide}`} onClick={placeOrder} disabled={halted}>{halted ? '执行已停止' : `${orderSide === 'buy' ? '买入' : '卖出'} BTC`}</button>
+          <div className="input-shell"><input id="amount" value={amount} placeholder="0.00" onChange={(event) => setAmount(event.target.value)} inputMode="decimal" /><span>{baseAsset}</span></div>
+          <div className="amount-presets">{[0.25, 0.5, 0.75, 1].map((ratio) => <button key={ratio} onClick={() => applyPreset(ratio)}>{ratio === 1 ? '最大' : `${ratio * 100}%`}</button>)}</div>
+          <div className="order-summary"><span>{marketType === 'futures' ? '预计保证金' : '预计金额'}</span><strong>{effectivePrice > 0 ? `$${(marketType === 'futures' ? estimated / leverage : estimated).toFixed(2)}` : '--'}</strong><span>可用余额</span><strong>${balance.toFixed(2)}</strong></div>
+          <div className={`risk-gate ${halted ? 'risk-gate-closed' : ''}`}><ShieldCheck size={17} /><div><strong>{halted ? '风控闸门已关闭' : tick.connected ? '风控闸门待命' : '等待真实行情'}</strong><span>{environment === 'live' ? '生产订单需要二次确认' : '下单时检查确定性规则'}</span></div></div>
+          <button className={`order-button ${orderSide === 'BUY' ? 'order-buy' : 'order-sell'}`} onClick={placeOrder} disabled={halted || !tick.connected || submitting}>{halted ? '执行已停止' : !tick.connected ? '等待行情' : submitting ? '提交中' : `${marketType === 'spot' ? (orderSide === 'BUY' ? '买入' : '卖出') : futuresActionLabel} ${baseAsset}`}</button>
         </aside>
       </section>
-
-      <section className="lower-grid">
-        <article className="panel agent-panel">
-          <header className="panel-header"><div><h2>Agent 状态</h2><p>策略、资金占用与最近动作</p></div><button className="text-button" onClick={() => onModal('agent')}>管理 Agent <ChevronRight size={15} /></button></header>
-          <div className="agent-list">{agents.map((agent) => <AgentRow key={agent.id} agent={agent} onToggle={onToggleAgent} />)}</div>
-        </article>
-        <article className="panel activity-panel">
-          <header className="panel-header"><div><h2>决策流水</h2><p>模型推理与执行审计</p></div><button className="icon-button" aria-label="筛选"><ListChecks size={17} /></button></header>
-          <div className="activity-list">
-            {activity.map((item) => (
-              <div className="activity-row" key={item.time}>
-                <div className={`timeline-mark mark-${item.status}`} />
-                <div><span>{item.time} · {item.agent}</span><strong>{item.title}</strong><p>{item.detail}</p></div>
-              </div>
-            ))}
-          </div>
-        </article>
-      </section>
+      <PortfolioTable positions={livePortfolio} updatedAt={account?.updatedAt} />
+      <OverviewAgentsPanel agents={agents} logs={agentLogs} account={account} currentEnvironment={environment} loading={agentsLoading} busyAgentIds={busyAgentIds} onToggle={onToggleAgent} onManage={onManageAgents} onNew={() => onModal('agent')} />
     </main>
   )
 }
 
-function AgentsView({ agents, onToggle, onNew }: { agents: Agent[]; onToggle: (id: string) => void; onNew: () => void }) {
-  return (
-    <main className="page">
-      <section className="page-heading"><div><span className="section-kicker">自治执行单元</span><h1>Agent</h1><p>为每个策略定义数据、模型、工具、权限和风控边界</p></div><button className="primary-button" onClick={onNew}><Plus size={16} />新建 Agent</button></section>
-      <div className="agent-card-grid">
-        {agents.map((agent) => (
-          <article className="agent-card" key={agent.id}>
-            <header><div className={`agent-icon agent-icon-${agent.id}`}><Bot size={18} /></div><span className={`agent-state state-${agent.status}`}><StatusDot live={agent.status === 'running'} />{agent.status === 'running' ? '运行中' : agent.status === 'observing' ? '观察中' : '已暂停'}</span><button className="icon-button"><MoreHorizontal size={17} /></button></header>
-            <h2>{agent.name}</h2><p>{agent.strategy}</p>
-            <div className="agent-card-market"><span>{agent.market}</span><span>风险 {agent.risk}</span></div>
-            <div className="agent-card-stats"><div><span>今日收益</span><strong className={agent.pnl >= 0 ? 'text-positive' : 'text-negative'}>{agent.pnl >= 0 ? '+' : ''}{agent.pnl.toFixed(2)}%</strong></div><div><span>资金占用</span><strong>{agent.allocation}%</strong></div></div>
-            <div className="agent-last"><span>最近动作</span><p>{agent.lastAction}</p></div>
-            <button className="secondary-button full-button" onClick={() => onToggle(agent.id)}>{agent.status === 'running' ? <Pause size={16} /> : <Play size={16} />}{agent.status === 'running' ? '暂停 Agent' : '启动 Agent'}</button>
-          </article>
-        ))}
-        <button className="new-agent-card" onClick={onNew}><span><Plus size={20} /></span><strong>创建交易 Agent</strong><p>从策略模板或空白流程开始</p></button>
-      </div>
-    </main>
-  )
+function ConnectionsView({ environment, binanceConfigured, modelConfigured, modelConfig, proxyUrl, onExchange, onModel, onNetwork, onToast }: { environment: Environment; binanceConfigured: boolean; modelConfigured: boolean; modelConfig: Record<string, string>; proxyUrl: string; onExchange: () => void; onModel: () => void; onNetwork: () => void; onToast: (message: string) => void }) {
+  const provider = getModelProvider(modelConfig.provider || 'custom')
+  return <main className="page"><section className="page-heading"><div><span className="section-kicker">基础设施</span><h1>连接</h1><p>交易所、模型路由、MCP 与网络出口的配置状态</p></div></section><section className="connection-section"><header className="section-header"><div><h2>交易所</h2><p>凭证加密保存在本机主进程，渲染层无法读取 Secret</p></div><button className="secondary-button" onClick={onExchange}><Plus size={16} />配置 Binance</button></header><div className="connection-list"><article className="connection-row"><span className="exchange-logo large">BN</span><div className="connection-main"><div><h3>Binance · {environmentLabel(environment)}</h3><span className={environment === 'paper' || binanceConfigured ? 'healthy-label' : 'warning-label'}><StatusDot live={environment === 'paper' || binanceConfigured} />{environment === 'paper' ? '本地模拟可用' : binanceConfigured ? '凭证已配置' : '尚未配置'}</span></div><p>现货 · USDT 永续 · 禁止提币 · 生产订单二次确认</p></div><div className="connection-meta"><span>行情</span><strong>共享 WS</strong></div><div className="connection-meta"><span>订单</span><strong>签名 REST</strong></div><button className="icon-button" onClick={onExchange} aria-label="配置 Binance"><Settings2 size={17} /></button></article></div></section><section className="connection-section"><header className="section-header"><div><h2>模型与推理</h2><p>原生 Claude / Gemini 与 OpenAI 兼容路由统一接入 AI 助手</p></div><button className="secondary-button" onClick={onModel}><Plus size={16} />配置模型</button></header><div className="connection-list"><article className="connection-row"><span className="model-logo large"><Command size={19} /></span><div className="connection-main"><div><h3>{modelConfig.model ? `${provider.label} · ${modelConfig.model}` : '模型路由'}</h3><span className={modelConfigured ? 'healthy-label' : 'warning-label'}><StatusDot live={modelConfigured} />{modelConfigured ? '连接已验证' : modelConfig.model ? '需要重新测试' : '等待配置'}</span></div><p>{modelConfig.baseUrl || '支持主流厂商、本地模型和自定义兼容接口'}</p></div><div className="connection-meta"><span>推理强度</span><strong>{modelConfig.reasoningEffort || '--'}</strong></div><div className="connection-meta"><span>最近延迟</span><strong>{modelConfig.lastLatency ? `${modelConfig.lastLatency} ms` : '--'}</strong></div><button className="icon-button" onClick={onModel} aria-label="配置模型"><Settings2 size={17} /></button></article></div></section><section className="connection-section"><header className="section-header"><div><h2>网络出口</h2><p>Binance、远程模型和远程 MCP 共用；本地服务自动直连</p></div><button className="secondary-button" onClick={onNetwork}><Network size={16} />配置代理</button></header><div className="connection-list"><article className="connection-row"><span className="model-logo large"><Network size={19} /></span><div className="connection-main"><div><h3>{proxyUrl ? 'HTTP / HTTPS 代理' : '系统直连'}</h3><span className="healthy-label"><StatusDot live />已启用</span></div><p>{proxyUrl || '未配置应用级代理'}</p></div><div className="connection-meta"><span>本地服务</span><strong>自动绕过</strong></div><div className="connection-meta"><span>变更后</span><strong>立即重连</strong></div><button className="icon-button" onClick={onNetwork} aria-label="配置代理"><Settings2 size={17} /></button></article></div><button className="connection-help" onClick={() => onToast('代理只接受 HTTP / HTTPS URL，不记录代理请求内容')}>网络出口说明</button></section></main>
 }
 
-function ConnectionsView({ onExchange, onModel }: { onExchange: () => void; onModel: () => void }) {
-  return (
-    <main className="page">
-      <section className="page-heading"><div><span className="section-kicker">基础设施</span><h1>连接</h1><p>交易所、模型路由与数据源的凭证和权限范围</p></div></section>
-      <section className="connection-section">
-        <header className="section-header"><div><h2>交易所</h2><p>交易权限与资产完全隔离，API 密钥仅保存在服务端</p></div><button className="secondary-button" onClick={onExchange}><Plus size={16} />添加交易所</button></header>
-        <div className="connection-list">
-          <article className="connection-row"><span className="exchange-logo large">BN</span><div className="connection-main"><div><h3>Binance Testnet</h3><span className="healthy-label"><StatusDot live />连接正常</span></div><p>现货 · 行情读取 · 交易 · 禁止提币</p></div><div className="connection-meta"><span>延迟</span><strong>82 ms</strong></div><div className="connection-meta"><span>最近同步</span><strong>8 秒前</strong></div><button className="icon-button"><Settings2 size={17} /></button></article>
-          <button className="add-connection-row" onClick={onExchange}><Plus size={17} /><span><strong>连接另一个交易账户</strong><small>Binance、OKX、Bybit 或兼容 CCXT 的交易所</small></span></button>
-        </div>
-      </section>
-      <section className="connection-section">
-        <header className="section-header"><div><h2>模型与推理</h2><p>所有 Agent 通过统一路由调用模型，便于限额、回退与审计</p></div><button className="secondary-button" onClick={onModel}><Plus size={16} />添加模型</button></header>
-        <div className="connection-list">
-          <article className="connection-row"><span className="model-logo large"><Command size={19} /></span><div className="connection-main"><div><h3>CCSwitch Router</h3><span className="healthy-label"><StatusDot live />可用</span></div><p>OpenAI 兼容接口 · 3 个模型 · 自动回退</p></div><div className="connection-meta"><span>今日调用</span><strong>1,284</strong></div><div className="connection-meta"><span>平均延迟</span><strong>1.8 s</strong></div><button className="icon-button"><Settings2 size={17} /></button></article>
-        </div>
-      </section>
-    </main>
-  )
+function HoldingsTable({ account, marketType }: { account: AccountSnapshot | null; marketType: MarketType }) {
+  if (marketType === 'futures' && account?.positions.length) return <div className="data-table"><div className="table-row table-head"><span>市场</span><span>方向</span><span>持仓</span><span>开仓均价</span><span>标记价格</span><span>未实现盈亏</span></div>{account.positions.map((position, index) => <div className="table-row" key={`${position.symbol}-${index}`}><strong>{position.symbol}</strong><span>{Number(position.positionAmt) >= 0 ? '多' : '空'}</span><span>{position.positionAmt}</span><span>{position.entryPrice}</span><span>{position.markPrice || '--'}</span><strong className={Number(position.unrealizedProfit) >= 0 ? 'text-positive' : 'text-negative'}>{Number(position.unrealizedProfit || 0).toFixed(2)}</strong></div>)}</div>
+  if (marketType === 'spot' && account?.balances.length) return <div className="data-table"><div className="table-row holdings-row table-head"><span>资产</span><span>可用</span><span>冻结</span><span>账户来源</span></div>{account.balances.map((balance) => <div className="table-row holdings-row" key={balance.asset}><strong>{balance.asset}</strong><span>{Number(balance.free || 0).toFixed(6)}</span><span>{Number(balance.locked || 0).toFixed(6)}</span><span>{account.source === 'binance' ? 'Binance' : '模拟盘'}</span></div>)}</div>
+  return <div className="table-empty"><WalletCards size={22} /><strong>{account ? '当前没有持仓' : '账户数据尚未载入'}</strong><p>{marketType === 'futures' ? '建立合约仓位后会显示方向、均价和实时盈亏' : '非零现货资产会显示在这里'}</p></div>
 }
 
-function RiskView({ halted, onEmergency }: { halted: boolean; onEmergency: () => void }) {
-  return (
-    <main className="page">
-      <section className="page-heading"><div><span className="section-kicker">执行前强制检查</span><h1>风险控制</h1><p>规则在 Agent 和交易所之间执行，模型无法绕过</p></div><button className={`emergency-button ${halted ? 'is-halted' : ''}`} onClick={onEmergency}><AlertOctagon size={17} />{halted ? '恢复执行' : '紧急停止'}</button></section>
-      <section className={`gate-status ${halted ? 'gate-stopped' : ''}`}>
-        <div className="gate-rail"><span /></div>
-        <div className="gate-copy"><span className="gate-icon"><ShieldCheck size={22} /></span><div><h2>{halted ? '风控总闸已关闭' : '风控总闸运行中'}</h2><p>{halted ? 'Agent 可以继续分析，但所有新订单都会被拒绝' : '所有订单必须逐项通过规则后才能提交到交易所'}</p></div></div>
-        <div className="gate-stats"><div><span>今日检查</span><strong>184</strong></div><div><span>已拒绝</span><strong className="text-negative">7</strong></div><div><span>保护资金</span><strong>$1,642</strong></div></div>
-      </section>
-      <section className="rule-grid">{riskRules.map((rule) => <article className="rule-card" key={rule.name}><header><Gauge size={17} /><span className={rule.state.includes('触发') ? 'warning-label' : 'healthy-label'}>{rule.state}</span></header><h3>{rule.name}</h3><strong>{rule.value}</strong><p>{rule.detail}</p><button className="icon-button"><Settings2 size={16} /></button></article>)}</section>
-      <section className="panel exposure-panel"><header className="panel-header"><div><h2>当前持仓敞口</h2><p>按标记价格实时计算</p></div><span className="quiet-chip">总敞口 11.4%</span></header><PositionsTable /></section>
-    </main>
-  )
+function RiskView({ halted, account, marketType, onEmergency, onToast }: { halted: boolean; account: AccountSnapshot | null; marketType: MarketType; onEmergency: () => void; onToast: (message: string) => void }) {
+  return <main className="page"><section className="page-heading"><div><span className="section-kicker">执行前强制检查</span><h1>风险控制</h1><p>规则在 Agent 和交易所之间执行，模型无法绕过</p></div><button className={`emergency-button ${halted ? 'is-halted' : ''}`} onClick={onEmergency}><AlertOctagon size={17} />{halted ? '恢复执行' : '紧急停止'}</button></section><section className={`gate-status ${halted ? 'gate-stopped' : ''}`}><div className="gate-rail"><span /></div><div className="gate-copy"><span className="gate-icon"><ShieldCheck size={22} /></span><div><h2>{halted ? '风控总闸已关闭' : '风控总闸运行中'}</h2><p>{halted ? 'Agent 可以继续分析，但所有新订单都会被拒绝' : '所有订单必须逐项通过规则后才能提交到交易所'}</p></div></div><div className="gate-stats"><div><span>今日检查</span><strong>184</strong></div><div><span>已拒绝</span><strong className="text-negative">7</strong></div><div><span>实时盈亏</span><strong className={Number(account?.unrealizedPnl || 0) >= 0 ? 'text-positive' : 'text-negative'}>{Number(account?.unrealizedPnl || 0).toFixed(2)}</strong></div></div></section><section className="rule-grid">{riskRules.map((rule) => <article className="rule-card" key={rule.name}><header><Gauge size={17} /><span className={rule.state.includes('触发') ? 'warning-label' : 'healthy-label'}>{rule.state}</span></header><h3>{rule.name}</h3><strong>{rule.value}</strong><p>{rule.detail}</p><button className="icon-button" onClick={() => onToast(`${rule.name} 参数已载入`)} aria-label={`配置${rule.name}`}><Settings2 size={16} /></button></article>)}</section><section className="panel exposure-panel"><header className="panel-header"><div><h2>{marketType === 'spot' ? '现货资产' : '当前持仓敞口'}</h2><p>按账户最新快照计算</p></div><span className="quiet-chip">{account?.source === 'binance' ? 'Binance 实时' : '模拟数据'}</span></header><HoldingsTable account={account} marketType={marketType} /></section></main>
 }
 
-function PositionsTable() {
-  return <div className="data-table"><div className="table-row table-head"><span>市场</span><span>方向</span><span>持仓</span><span>开仓均价</span><span>标记价格</span><span>未实现盈亏</span></div>{positions.map((position) => <div className="table-row" key={position.market}><strong>{position.market}</strong><span>{position.side}</span><span>{position.size}</span><span>{position.entry}</span><span>{position.mark}</span><strong className={position.pnl.startsWith('+') ? 'text-positive' : 'text-negative'}>{position.pnl} <small>{position.percent}</small></strong></div>)}</div>
-}
-
-function GenericView({ active }: { active: NavId }) {
-  const content = {
-    strategies: { title: '策略库', kicker: '可复用交易逻辑', description: '验证、版本化并部署 Agent 使用的策略模块', icon: Network },
-    orders: { title: '订单与持仓', kicker: '统一执行记录', description: '跨 Agent、账户和交易所查看订单生命周期', icon: WalletCards },
-    review: { title: '复盘', kicker: '从每一次决策中学习', description: '将策略信号、模型推理、风险判断与成交结果放在同一条时间线上', icon: SquareActivity },
-  }[active as 'strategies' | 'orders' | 'review']
-  const Icon = content.icon
-  return <main className="page"><section className="page-heading"><div><span className="section-kicker">{content.kicker}</span><h1>{content.title}</h1><p>{content.description}</p></div><button className="primary-button"><Plus size={16} />新建</button></section><section className="panel feature-preview"><div className="feature-icon"><Icon size={24} /></div><h2>{active === 'strategies' ? '策略版本与回测将在这里统一管理' : active === 'orders' ? '订单执行链路已接入统一审计' : '交易复盘将自动关联 Agent 的每一步判断'}</h2><p>{active === 'strategies' ? '从信号生成、仓位计算到退出条件，每个模块都可以独立测试和复用。' : active === 'orders' ? '模拟盘与真实账户明确分区，订单从意图、风控、提交到成交全程可追溯。' : '系统会保留当时的市场快照、提示词版本、工具调用和最终成交表现。'}</p><button className="secondary-button">查看产品路线 <ArrowUpRight size={16} /></button></section></main>
-}
-
-function ExchangeModal({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
-  const [environment, setEnvironment] = useState<'testnet' | 'live'>('testnet')
+function ExchangeModal({ initialEnvironment, onClose, onSaved }: { initialEnvironment: Environment; onClose: () => void; onSaved: (environment: Environment) => void }) {
+  const [environment, setEnvironment] = useState<Environment>(initialEnvironment)
   const [apiKey, setApiKey] = useState('')
   const [apiSecret, setApiSecret] = useState('')
+  const [spot, setSpot] = useState(true)
+  const [futures, setFutures] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const saveConnection = async () => {
-    setSaving(true)
+    if (environment !== 'paper' && (!apiKey.trim() || !apiSecret.trim())) return setError('API Key 和 Secret Key 均不能为空')
+    if (!spot && !futures) return setError('至少选择一个市场权限')
+    setSaving(true); setError(null)
     try {
-      await saveSecrets('binance-primary', { environment, apiKey, apiSecret })
-      onSaved()
-    } finally {
-      setSaving(false)
-    }
+      if (environment !== 'paper') {
+        const marketTypes = [...(spot ? ['spot'] : []), ...(futures ? ['futures'] : [])]
+        if (!window.atlas) throw new Error('交易所连接测试需要在桌面应用中运行')
+        await window.atlas.binance.test({ environment, marketTypes, apiKey: apiKey.trim(), apiSecret: apiSecret.trim() })
+        await saveSecrets(`binance-${environment}`, { environment, apiKey: apiKey.trim(), apiSecret: apiSecret.trim(), marketTypes: marketTypes.join(','), health: 'healthy', lastTestedAt: String(Date.now()) })
+      }
+      onSaved(environment)
+    } catch (caught) { setError(caught instanceof Error ? caught.message : '连接测试失败') } finally { setSaving(false) }
   }
-  return <Modal title="连接 Binance" subtitle="密钥应只保存在本地服务端，前端不会读取账户凭证" onClose={onClose}>
-    <div className="form-stack">
-      <div className="notice-box"><LockKeyhole size={18} /><div><strong>推荐使用专用子账户</strong><p>仅开启读取与现货交易权限，关闭提币，并配置服务器 IP 白名单</p></div></div>
-      <label className="field-label">环境</label><div className="segmented"><button className={environment === 'testnet' ? 'active' : ''} onClick={() => setEnvironment('testnet')}>Testnet 模拟盘</button><button className={environment === 'live' ? 'active' : ''} onClick={() => setEnvironment('live')}>真实账户</button></div>
-      <label className="field-label" htmlFor="api-key">API Key</label><div className="input-shell"><KeyRound size={16} /><input id="api-key" type="password" placeholder="输入 Binance API Key" value={apiKey} onChange={(event) => setApiKey(event.target.value)} /></div>
-      <label className="field-label" htmlFor="api-secret">Secret Key</label><div className="input-shell"><KeyRound size={16} /><input id="api-secret" type="password" placeholder="输入 Secret Key" value={apiSecret} onChange={(event) => setApiSecret(event.target.value)} /></div>
-      <div className="permission-list"><div><span><Radio size={15} />读取行情与账户</span><strong className="healthy-label">必须</strong></div><div><span><CircleDollarSign size={15} />现货交易</span><label className="switch"><input type="checkbox" defaultChecked /><span /></label></div><div><span><Unplug size={15} />提币权限</span><strong className="blocked-label">始终禁用</strong></div></div>
-      <div className="modal-actions"><button className="secondary-button" onClick={onClose}>取消</button><button className="primary-button" onClick={saveConnection} disabled={saving}><Cable size={16} />{saving ? '加密保存中' : '测试并保存'}</button></div>
-    </div>
-  </Modal>
+  return <Modal title="连接 Binance" subtitle="凭证仅由 Electron 主进程解密，提币能力不会暴露给工作台" onClose={onClose}><div className="form-stack"><div className="notice-box"><LockKeyhole size={18} /><div><strong>使用专用子账户和 IP 白名单</strong><p>生产 API 只开放读取与交易权限，始终关闭提币</p></div></div><label className="field-label">环境</label><div className="segmented">{(['paper', 'testnet', 'live'] as Environment[]).map((value) => <button key={value} className={environment === value ? 'active' : ''} onClick={() => setEnvironment(value)}>{environmentLabel(value)}</button>)}</div>{environment === 'live' && <div className="production-warning"><AlertOctagon size={16} /><span>正在配置真实资金环境；所有生产订单仍需逐笔二次确认</span></div>}{environment !== 'paper' && <><label className="field-label" htmlFor="api-key">API Key</label><div className="input-shell"><KeyRound size={16} /><input id="api-key" type="password" placeholder="输入 Binance API Key" value={apiKey} onChange={(event) => setApiKey(event.target.value)} /></div><label className="field-label" htmlFor="api-secret">Secret Key</label><div className="input-shell"><KeyRound size={16} /><input id="api-secret" type="password" placeholder="输入 Secret Key" value={apiSecret} onChange={(event) => setApiSecret(event.target.value)} /></div></>}<div className="permission-list"><div><span><Radio size={15} />现货交易</span><label className="switch"><input type="checkbox" checked={spot} onChange={(event) => setSpot(event.target.checked)} /><span /></label></div><div><span><CircleDollarSign size={15} />USDT 永续</span><label className="switch"><input type="checkbox" checked={futures} onChange={(event) => setFutures(event.target.checked)} /><span /></label></div><div><span><Unplug size={15} />提币权限</span><strong className="blocked-label">始终禁用</strong></div></div>{error && <p className="form-error">{error}</p>}<div className="modal-actions"><button className="secondary-button" onClick={onClose}>取消</button><button className="primary-button" onClick={saveConnection} disabled={saving}><Cable size={16} />{saving ? '正在验证' : environment === 'paper' ? '启用模拟盘' : '测试并保存'}</button></div></div></Modal>
 }
 
 function ModelModal({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
+  const [provider, setProvider] = useState('ccswitch')
   const [apiKey, setApiKey] = useState('')
-  const [baseUrl, setBaseUrl] = useState('http://127.0.0.1:3000/v1')
-  const [model, setModel] = useState('claude-sonnet-4.5')
+  const [baseUrl, setBaseUrl] = useState('http://127.0.0.1:15721/v1')
+  const [model, setModel] = useState('claude-sonnet-5-5')
+  const [reasoningEffort, setReasoningEffort] = useState('medium')
   const [saving, setSaving] = useState(false)
-  const saveConnection = async () => {
-    setSaving(true)
+  const [testing, setTesting] = useState(false)
+  const [remoteModels, setRemoteModels] = useState<Array<{ id: string; name: string }>>([])
+  const [testResult, setTestResult] = useState<{ signature: string; latency: number; count: number } | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const providerDefinition = getModelProvider(provider)
+  const signature = `${provider}|${providerDefinition.protocol}|${baseUrl.trim()}`
+  const availableModels = useMemo(() => [...new Set([...providerDefinition.models, ...remoteModels.map((item) => item.id)])], [providerDefinition.models, remoteModels])
+
+  useEffect(() => {
+    let cancelled = false
+    getVaultStatus('model-router').then((status) => {
+      if (cancelled || !status.config) return
+      const config = status.config
+      const nextProvider = config.provider || 'custom'
+      const legacyCcswitch = nextProvider === 'ccswitch' && /^https?:\/\/(127\.0\.0\.1|localhost):3000(?:\/v1)?\/?$/i.test(config.baseUrl || '')
+      const nextBaseUrl = legacyCcswitch ? 'http://127.0.0.1:15721/v1' : config.baseUrl || getModelProvider(nextProvider).baseUrl
+      setProvider(nextProvider)
+      setBaseUrl(nextBaseUrl)
+      setModel(config.model || '')
+      setReasoningEffort(config.reasoningEffort || 'medium')
+      if (!legacyCcswitch && config.health === 'healthy') setTestResult({ signature: `${nextProvider}|${config.protocol}|${nextBaseUrl}`, latency: Number(config.lastLatency || 0), count: Number(config.modelCount || 0) })
+    }).catch(() => undefined)
+    return () => { cancelled = true }
+  }, [])
+
+  const validate = () => {
+    if (!baseUrl.trim()) { setError('Base URL 不能为空'); return false }
     try {
-      await saveSecrets('model-router', { apiKey, baseUrl, model })
-      onSaved()
-    } finally {
-      setSaving(false)
-    }
+      const url = new URL(baseUrl)
+      if (!['http:', 'https:'].includes(url.protocol)) throw new Error()
+    } catch { setError('请输入有效的 HTTP 或 HTTPS 地址'); return false }
+    return true
   }
-  return <Modal title="添加模型路由" subtitle="支持 CCSwitch 与所有 OpenAI 兼容接口" onClose={onClose}>
-    <div className="form-stack">
-      <label className="field-label" htmlFor="provider">提供方</label><select id="provider" className="select-field" defaultValue="ccswitch"><option value="ccswitch">CCSwitch</option><option value="openai">OpenAI Compatible</option><option value="anthropic">Anthropic</option><option value="local">本地模型</option></select>
-      <label className="field-label" htmlFor="base-url">Base URL</label><div className="input-shell"><Network size={16} /><input id="base-url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} /></div>
-      <label className="field-label" htmlFor="model-key">API Key</label><div className="input-shell"><KeyRound size={16} /><input id="model-key" type="password" placeholder="由系统加密后保存在本机" value={apiKey} onChange={(event) => setApiKey(event.target.value)} /></div>
-      <label className="field-label" htmlFor="model-name">默认模型</label><div className="input-shell"><BrainCircuit size={16} /><input id="model-name" value={model} onChange={(event) => setModel(event.target.value)} /></div>
-      <div className="notice-box subtle"><Zap size={18} /><div><strong>故障回退</strong><p>主模型超时后切换到备用模型；涉及下单的输出仍需结构化校验与风控确认</p></div></div>
-      <div className="modal-actions"><button className="secondary-button" onClick={onClose}>取消</button><button className="primary-button" onClick={saveConnection} disabled={saving}><Cable size={16} />{saving ? '加密保存中' : '测试并保存'}</button></div>
-    </div>
-  </Modal>
+
+  const testConnection = async () => {
+    if (!validate()) return
+    if (!window.atlas) return setError('模型连接测试需要在 Atlas 桌面应用中运行')
+    setTesting(true); setError(null); setTestResult(null)
+    try {
+      const result = await window.atlas.ai.models({ provider, protocol: providerDefinition.protocol, baseUrl: baseUrl.trim(), apiKey: apiKey.trim() || undefined, fallbackModels: providerDefinition.models, force: true })
+      setRemoteModels(result.models)
+      const nextModels = result.models.map((item) => item.id)
+      if (!model.trim() && nextModels[0]) setModel(nextModels[0])
+      setTestResult({ signature, latency: result.latency, count: result.models.length })
+    } catch (caught) { setError(caught instanceof Error ? caught.message : '模型连接测试失败') } finally { setTesting(false) }
+  }
+
+  const saveConnection = async () => {
+    if (!validate() || !model.trim()) return setError('Base URL 和模型名称不能为空')
+    if (!testResult || testResult.signature !== signature) return setError('请先测试当前厂商和 Base URL，确认模型目录可用')
+    setSaving(true); setError(null)
+    try {
+      const values: Record<string, string> = {
+        provider,
+        protocol: providerDefinition.protocol,
+        reasoningMode: providerDefinition.reasoningMode,
+        baseUrl: baseUrl.trim(),
+        model: model.trim(),
+        reasoningEffort,
+        health: 'healthy',
+        lastTestedAt: String(Date.now()),
+        lastLatency: String(testResult.latency),
+        modelCount: String(testResult.count),
+      }
+      if (apiKey.trim()) values.apiKey = apiKey.trim()
+      await saveSecrets('model-router', values)
+      onSaved()
+    } catch (caught) { setError(caught instanceof Error ? caught.message : '模型配置保存失败') } finally { setSaving(false) }
+  }
+  const applyProvider = (value: string) => {
+    const definition = getModelProvider(value)
+    setProvider(value)
+    setBaseUrl(definition.baseUrl)
+    setModel(definition.defaultModel)
+    setApiKey('')
+    setRemoteModels([])
+    setTestResult(null)
+    setError(null)
+  }
+  return <Modal title="配置模型路由" subtitle="主流厂商原生协议、聚合路由与本地模型统一配置" onClose={onClose}><div className="form-stack"><label className="field-label" htmlFor="provider">模型厂商</label><select id="provider" className="select-field" value={provider} onChange={(event) => applyProvider(event.target.value)}>{modelProviders.map((item) => <option value={item.id} key={item.id}>{item.label}</option>)}</select><p className="model-provider-note">{providerDefinition.note}</p><label className="field-label" htmlFor="base-url">Base URL</label><div className="input-shell"><Network size={16} /><input id="base-url" list="base-url-options" value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setTestResult(null) }} /></div><datalist id="base-url-options">{modelProviders.map((item) => <option value={item.baseUrl} key={item.id} />)}</datalist><label className="field-label" htmlFor="model-key">API Key</label><div className="input-shell"><KeyRound size={16} /><input id="model-key" type="password" placeholder={providerDefinition.keyOptional ? '本地服务可留空；已保存密钥会保持不变' : '输入 API Key；留空保持已保存密钥'} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setTestResult(null) }} /></div><div className="model-config-grid"><div><label className="field-label" htmlFor="model-name">默认模型</label><div className="input-shell"><BrainCircuit size={16} /><input id="model-name" list="model-options" value={model} onChange={(event) => setModel(event.target.value)} placeholder="选择或输入模型 ID" /></div><datalist id="model-options">{availableModels.map((modelId) => <option value={modelId} key={modelId} />)}</datalist></div><div><label className="field-label" htmlFor="reasoning-effort">推理强度</label><select id="reasoning-effort" className="select-field" value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value)}><option value="none">无</option><option value="minimal">最低</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option><option value="max">最高</option></select></div></div><div className="model-test-row"><button className="secondary-button" onClick={testConnection} disabled={testing}><RefreshCw size={15} />{testing ? '正在读取模型' : '测试连接并刷新模型'}</button>{testResult?.signature === signature && <span className="model-test-result"><StatusDot live />{testResult.count} 个模型 · {testResult.latency} ms</span>}</div><div className="notice-box subtle"><Zap size={18} /><div><strong>执行隔离</strong><p>模型只生成分析和交易意图，不能绕过订单确认与风险规则</p></div></div>{error && <p className="form-error">{error}</p>}<div className="modal-actions"><button className="secondary-button" onClick={onClose}>取消</button><button className="primary-button" onClick={saveConnection} disabled={saving || testing}><Cable size={16} />{saving ? '加密保存中' : '保存已验证连接'}</button></div></div></Modal>
 }
 
-function AgentModal({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
-  return <Modal title="创建交易 Agent" subtitle="从策略意图开始，执行权限最后单独授予" onClose={onClose} wide>
-    <div className="agent-builder">
-      <div className="builder-main form-stack"><label className="field-label" htmlFor="agent-name">名称</label><div className="input-shell"><Bot size={16} /><input id="agent-name" defaultValue="BTC 趋势跟随" /></div><label className="field-label" htmlFor="objective">交易目标</label><textarea id="objective" defaultValue="监控 BTC/USDT 的 4 小时趋势，在 15 分钟级别寻找低风险入场；每笔风险不超过净值 0.5%。" /><label className="field-label">可用工具</label><div className="tool-grid"><label><input type="checkbox" defaultChecked /><ChartCandlestick size={17} /><span>实时行情</span></label><label><input type="checkbox" defaultChecked /><Activity size={17} /><span>技术指标</span></label><label><input type="checkbox" defaultChecked /><MessageSquareText size={17} /><span>新闻检索</span></label><label><input type="checkbox" /><CircleDollarSign size={17} /><span>订单执行</span></label></div></div>
-      <aside className="builder-aside"><h3>执行流程</h3>{['读取市场状态', '生成结构化信号', '独立风险检查', '提交到模拟盘', '记录结果并复盘'].map((step, index) => <div className="flow-step" key={step}><span>{index + 1}</span><p>{step}</p>{index < 4 && <i />}</div>)}<div className="builder-note"><ShieldCheck size={17} /><p>新 Agent 默认只读。通过模拟盘验证后，才可申请真实交易权限。</p></div></aside>
-    </div>
-    <div className="modal-actions"><button className="secondary-button" onClick={onClose}>保存草稿</button><button className="primary-button" onClick={onSaved}><Play size={16} />创建并在模拟盘运行</button></div>
-  </Modal>
+function NetworkModal({ initialProxyUrl, onClose, onSaved }: { initialProxyUrl: string; onClose: () => void; onSaved: (proxyUrl: string, latency: number) => void }) {
+  const [proxyUrl, setProxyUrl] = useState(initialProxyUrl)
+  const [testing, setTesting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const testAndSave = async () => {
+    setTesting(true); setError(null)
+    try {
+      if (!window.atlas) throw new Error('网络测试需要在桌面应用中运行')
+      const result = await window.atlas.network.test({ proxyUrl: proxyUrl.trim() || undefined })
+      await saveSecrets('network', { proxyUrl: proxyUrl.trim() })
+      onSaved(proxyUrl.trim(), result.latency)
+    } catch (caught) { setError(caught instanceof Error ? caught.message : '网络测试失败') } finally { setTesting(false) }
+  }
+  return <Modal title="网络出口" subtitle="为远程 REST、WebSocket、模型和 MCP 配置统一代理" onClose={onClose}><div className="form-stack"><div className="notice-box subtle"><Network size={18} /><div><strong>本地服务保持直连</strong><p>localhost 与 127.0.0.1 的 CCSwitch、模型和 MCP 不经过代理</p></div></div><label className="field-label" htmlFor="proxy-url">HTTP / HTTPS 代理</label><div className="input-shell"><Network size={16} /><input id="proxy-url" value={proxyUrl} onChange={(event) => setProxyUrl(event.target.value)} placeholder="留空使用系统直连，例如 http://127.0.0.1:7890" /></div>{error && <p className="form-error">{error}</p>}<div className="modal-actions"><button className="secondary-button" onClick={onClose}>取消</button><button className="primary-button" onClick={testAndSave} disabled={testing}><Network size={16} />{testing ? '正在测试' : '测试并应用'}</button></div></div></Modal>
+}
+
+function LiveOrderModal({ order, onClose, onConfirm }: { order: TradingOrder; onClose: () => void; onConfirm: () => Promise<void> }) {
+  const [confirmation, setConfirmation] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const confirm = async () => { if (submitting) return; setSubmitting(true); try { await onConfirm() } finally { setSubmitting(false) } }
+  return <Modal title="确认生产订单" subtitle="该操作将向 Binance 生产环境提交真实订单" onClose={onClose}><div className="live-order-confirm"><div className="production-warning"><AlertOctagon size={18} /><span>真实资金操作不可撤销。请核对市场、方向、类型、数量和价格。</span></div><dl><div><dt>市场</dt><dd>{order.symbol} · {order.marketType === 'spot' ? '现货' : 'USDT 永续'}</dd></div><div><dt>方向</dt><dd className={order.side === 'BUY' ? 'text-positive' : 'text-negative'}>{order.side === 'BUY' ? '买入 / 做多' : '卖出 / 做空'}</dd></div><div><dt>类型</dt><dd>{order.type === 'MARKET' ? '市价' : `限价 ${order.price} USDT`}</dd></div><div><dt>数量</dt><dd>{order.quantity}</dd></div></dl><label className="field-label" htmlFor="live-confirm">输入 LIVE 确认</label><div className="input-shell"><LockKeyhole size={16} /><input id="live-confirm" value={confirmation} onChange={(event) => setConfirmation(event.target.value)} placeholder="LIVE" autoComplete="off" /></div><div className="modal-actions"><button className="secondary-button" onClick={onClose}>取消</button><button className="danger-button" onClick={confirm} disabled={confirmation !== 'LIVE' || submitting}>{submitting ? '提交中' : '提交真实订单'}</button></div></div></Modal>
 }
 
 export default function App() {
   const [active, setActive] = useState<NavId>('overview')
   const [modal, setModal] = useState<ModalId>(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [commandOpen, setCommandOpen] = useState(false)
   const [halted, setHalted] = useState(false)
-  const [agentList, setAgentList] = useState(initialAgents)
+  const [agentList, setAgentList] = useState<AgentDefinition[]>([])
+  const [agentLogs, setAgentLogs] = useState<AgentEvent[]>([])
+  const [agentsLoading, setAgentsLoading] = useState(true)
+  const [agentsError, setAgentsError] = useState<string | null>(null)
+  const [busyAgentIds, setBusyAgentIds] = useState<Set<string>>(new Set())
+  const [busyIntentIds, setBusyIntentIds] = useState<Set<string>>(new Set())
   const [toast, setToast] = useState<string | null>(null)
+  const [environment, setEnvironment] = useState<Environment>('paper')
+  const [marketType, setMarketType] = useState<MarketType>('spot')
+  const [symbolsByMarket, setSymbolsByMarket] = useState<Record<MarketType, string>>({ spot: 'BTCUSDT', futures: 'BTCUSDT' })
+  const [interval, setInterval] = useState<MarketInterval>('15m')
+  const [account, setAccount] = useState<AccountSnapshot | null>(null)
+  const [enabledSkills, setEnabledSkills] = useState(new Set(builtInSkills.slice(0, 2).map((skill) => skill.id)))
+  const [mcpConnection, setMcpConnection] = useState<McpConnection | null>(null)
+  const [binanceEnvironments, setBinanceEnvironments] = useState({ testnet: false, live: false })
+  const [modelConfigured, setModelConfigured] = useState(false)
+  const [modelConfig, setModelConfig] = useState<Record<string, string>>({})
+  const [proxyUrl, setProxyUrl] = useState('')
+  const [connectionRevision, setConnectionRevision] = useState(0)
+  const [pendingLiveOrder, setPendingLiveOrder] = useState<TradingOrder | null>(null)
+  const symbol = symbolsByMarket[marketType]
+  const { tick, book } = useMarketData(marketType, symbol, interval)
+  const binanceConfigured = environment === 'paper' ? true : binanceEnvironments[environment]
+  const latestTick = useRef(tick)
+  useEffect(() => { latestTick.current = tick }, [tick])
 
-  const showToast = (message: string) => {
+  const showToast = useCallback((message: string) => {
     setToast(message)
     window.setTimeout(() => setToast(null), 3200)
-  }
+  }, [])
 
-  const toggleAgent = (id: string) => {
-    setAgentList((items) => items.map((agent) => agent.id === id ? { ...agent, status: agent.status === 'running' ? 'paused' : 'running' } : agent))
-  }
+  const refreshAgents = useCallback(async () => {
+    if (!window.atlas?.agents) {
+      setAgentsLoading(false)
+      setAgentsError('Agent 运行时桥接尚未载入，请重新启动 Atlas 桌面开发版')
+      return
+    }
+    setAgentsLoading(true)
+    try {
+      const [definitions, events] = await Promise.all([
+        window.atlas.agents.list(),
+        window.atlas.agents.logs({ limit: 500 }),
+      ])
+      setAgentList(definitions)
+      setAgentLogs(events)
+      setAgentsError(null)
+    } catch (caught) {
+      setAgentsError(caught instanceof Error ? caught.message : 'Agent 运行时同步失败')
+    } finally {
+      setAgentsLoading(false)
+    }
+  }, [])
 
-  const saveModal = (message: string) => {
+  useEffect(() => {
+    let active = true
+    let inFlight = false
+    const poll = async () => {
+      if (!active || inFlight) return
+      inFlight = true
+      try { await refreshAgents() } finally { inFlight = false }
+    }
+    void poll()
+    const timer = window.setInterval(poll, 1800)
+    return () => { active = false; window.clearInterval(timer) }
+  }, [refreshAgents])
+
+  const changeSymbol = useCallback((value: string) => {
+    setAccount(null)
+    setSymbolsByMarket((current) => current[marketType] === value ? current : { ...current, [marketType]: value })
+  }, [marketType])
+
+  useEffect(() => {
+    const keyHandler = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); setCommandOpen(true) }
+      if (event.key === 'Escape') setCommandOpen(false)
+    }
+    window.addEventListener('keydown', keyHandler)
+    return () => window.removeEventListener('keydown', keyHandler)
+  }, [])
+
+  useEffect(() => {
+    window.atlas?.risk?.status().then((result) => setHalted(result.halted))
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    Promise.all([getVaultStatus('binance-testnet'), getVaultStatus('binance-live'), getVaultStatus('binance-primary'), getVaultStatus('model-router'), getVaultStatus('network')]).then(([testnet, live, legacy, model, network]) => {
+      if (!cancelled) {
+        setBinanceEnvironments({
+          testnet: testnet.config?.health === 'healthy' || (legacy.config?.environment === 'testnet' && legacy.configured),
+          live: live.config?.health === 'healthy' || (legacy.config?.environment === 'live' && legacy.configured),
+        })
+        setModelConfig(model.config || {})
+        setModelConfigured(model.config?.health === 'healthy')
+        setProxyUrl(network.config?.proxyUrl || '')
+      }
+    })
+    return () => { cancelled = true }
+  }, [connectionRevision])
+
+  const refreshAccount = useCallback(async () => {
+    try {
+      const currentTick = latestTick.current
+      const snapshot = await window.atlas?.binance.account({
+        environment,
+        marketType,
+        symbol,
+        markPrice: currentTick.symbol === symbol && currentTick.connected ? currentTick.price : undefined,
+      })
+      if (snapshot) setAccount(snapshot)
+    } catch (caught) {
+      setAccount(null)
+      showToast(caught instanceof Error ? caught.message : '账户同步失败')
+    }
+  }, [environment, marketType, showToast, symbol])
+
+  useEffect(() => {
+    if (environment === 'paper' || !binanceConfigured || !window.atlas) return
+    const options = { environment, marketType }
+    let refreshTimer: number | null = null
+    const off = window.atlas.binance.onAccountUpdate((update) => {
+      if (update.type !== 'account' || update.environment !== environment || update.marketType !== marketType) return
+      if (refreshTimer) window.clearTimeout(refreshTimer)
+      refreshTimer = window.setTimeout(refreshAccount, 100)
+    })
+    window.atlas.binance.subscribeAccount(options).catch((caught) => showToast(caught instanceof Error ? caught.message : '账户实时数据流连接失败'))
+    return () => {
+      off()
+      if (refreshTimer) window.clearTimeout(refreshTimer)
+      window.atlas?.binance.unsubscribeAccount(options)
+    }
+  }, [binanceConfigured, environment, marketType, refreshAccount, showToast])
+
+  useEffect(() => {
+    let cancelled = false
+    const refresh = async () => {
+      try {
+        const currentTick = latestTick.current
+        const snapshot = await window.atlas?.binance.account({ environment, marketType, symbol, markPrice: currentTick.symbol === symbol && currentTick.connected ? currentTick.price : undefined })
+        if (!cancelled && snapshot) setAccount(snapshot)
+      } catch (caught) {
+        if (!cancelled) { setAccount(null); showToast(caught instanceof Error ? caught.message : '账户同步失败') }
+      }
+    }
+    refresh()
+    const timer = window.setInterval(refresh, environment === 'paper' ? 1000 : 5000)
+    return () => { cancelled = true; window.clearInterval(timer) }
+  }, [environment, marketType, showToast, symbol])
+
+  const toggleAgent = useCallback(async (agent: AgentDefinition) => {
+    if (!window.atlas?.agents || busyAgentIds.has(agent.id)) {
+      if (!window.atlas?.agents) showToast('Agent 运行时桥接尚未载入，请重新启动 Atlas 桌面开发版')
+      return
+    }
+    setBusyAgentIds((current) => new Set(current).add(agent.id))
+    try {
+      if (agent.status === 'running') await window.atlas.agents.pause(agent.id)
+      else await window.atlas.agents.start(agent.id)
+      await refreshAgents()
+      showToast(`${agent.name} 已${agent.status === 'running' ? '暂停' : '启动'}`)
+    } catch (caught) {
+      showToast(caught instanceof Error ? caught.message : 'Agent 状态更新失败')
+    } finally {
+      setBusyAgentIds((current) => { const next = new Set(current); next.delete(agent.id); return next })
+    }
+  }, [busyAgentIds, refreshAgents, showToast])
+
+  const createAgent = useCallback(async (definition: AgentCreateInput) => {
+    if (!window.atlas?.agents) throw new Error('Agent 运行时桥接尚未载入，请重新启动 Atlas 桌面开发版')
+    const created = await window.atlas.agents.create(definition)
+    await refreshAgents()
     setModal(null)
-    showToast(message)
+    setActive('agents')
+    showToast(`${created.name} 已创建，当前保持暂停`)
+  }, [refreshAgents, showToast])
+
+  const confirmAgentIntent = useCallback(async (intent: AgentIntent) => {
+    if (!window.atlas?.agents || busyIntentIds.has(intent.id)) {
+      if (!window.atlas?.agents) showToast('Agent 运行时桥接尚未载入，请重新启动 Atlas 桌面开发版')
+      return
+    }
+    setBusyIntentIds((current) => new Set(current).add(intent.id))
+    try {
+      const result = await window.atlas.agents.confirmIntent(intent.id)
+      showToast(`生产订单已提交 · ${result.order.status || 'NEW'} · ${result.order.symbol}`)
+    } catch (caught) {
+      showToast(caught instanceof Error ? caught.message : '生产订单确认失败')
+    } finally {
+      await refreshAgents()
+      setBusyIntentIds((current) => { const next = new Set(current); next.delete(intent.id); return next })
+    }
+  }, [busyIntentIds, refreshAgents, showToast])
+  const toggleSkill = (id: string) => setEnabledSkills((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next })
+
+  const placeOrder = useCallback(async (order: TradingOrder) => {
+    if (order.environment === 'live') { setPendingLiveOrder(order); return }
+    try {
+      if (!window.atlas) throw new Error('订单执行需要在 Atlas 桌面应用中运行')
+      const result = await window.atlas.binance.placeOrder(order)
+      await refreshAccount()
+      showToast(`${environmentLabel(order.environment)}订单已提交 · ${result.status || 'NEW'} · ${order.symbol}`)
+    } catch (caught) { showToast(caught instanceof Error ? caught.message : '订单提交失败') }
+  }, [refreshAccount, showToast])
+
+  const confirmLiveOrder = async () => {
+    if (!pendingLiveOrder) return
+    try {
+      const result = await window.atlas?.binance.placeOrder({ ...pendingLiveOrder, confirmation: 'LIVE_ORDER_CONFIRMED' })
+      await refreshAccount()
+      setPendingLiveOrder(null)
+      showToast(`生产订单已提交 · ${result?.status || 'NEW'} · ${pendingLiveOrder.symbol}`)
+    } catch (caught) { showToast(caught instanceof Error ? caught.message : '生产订单提交失败') }
+  }
+
+  const changeEnvironment = (value: Environment) => {
+    setAccount(null)
+    setEnvironment(value)
+    showToast(value === 'live' ? '已切换到生产环境，真实订单需要逐笔确认' : `已切换到${environmentLabel(value)}`)
+  }
+
+  const navigate = (id: string) => {
+    if (navigation.some((item) => item.id === id)) setActive(id as NavId)
   }
 
   return (
     <div className="app-shell">
-      <Sidebar active={active} onNavigate={setActive} open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
+      <Sidebar active={active} onNavigate={setActive} open={sidebarOpen} onClose={() => setSidebarOpen(false)} environment={environment} binanceConfigured={binanceConfigured} modelConfigured={modelConfigured} agentCount={agentList.length} />
       {sidebarOpen && <button className="sidebar-scrim" onClick={() => setSidebarOpen(false)} aria-label="关闭导航" />}
       <div className="app-main">
-        <Topbar onMenu={() => setSidebarOpen(true)} onModal={setModal} />
-        {active === 'overview' && <Overview onModal={setModal} halted={halted} agents={agentList} onToggleAgent={toggleAgent} onToast={showToast} />}
-        {active === 'agents' && <AgentsView agents={agentList} onToggle={toggleAgent} onNew={() => setModal('agent')} />}
-        {active === 'connections' && <ConnectionsView onExchange={() => setModal('exchange')} onModel={() => setModal('model')} />}
-        {active === 'risk' && <RiskView halted={halted} onEmergency={() => setModal('emergency')} />}
-        {(active === 'strategies' || active === 'orders' || active === 'review') && <GenericView active={active} />}
+        <Topbar environment={environment} marketType={marketType} onEnvironment={changeEnvironment} onMarketType={(value) => { setAccount(null); setMarketType(value); showToast(`已切换到${value === 'spot' ? '现货' : 'USDT 永续'}`) }} onMenu={() => setSidebarOpen(true)} onModal={setModal} onSearch={() => setCommandOpen(true)} onAccount={() => showToast('本地工作区用户 · 凭证由系统钥匙串保护')} />
+        {active === 'overview' && <Overview key={`${marketType}:${symbol}`} environment={environment} marketType={marketType} symbol={symbol} interval={interval} account={account} tick={tick} book={book} halted={halted} agents={agentList} agentLogs={agentLogs} agentsLoading={agentsLoading} busyAgentIds={busyAgentIds} onSymbol={changeSymbol} onInterval={setInterval} onModal={setModal} onToggleAgent={toggleAgent} onManageAgents={() => setActive('agents')} onPlaceOrder={placeOrder} onRefreshAccount={refreshAccount} onToast={showToast} />}
+        {active === 'assistant' && <AssistantView environment={environment} marketType={marketType} symbol={symbol} tick={tick} account={account} halted={halted} enabledSkills={[...enabledSkills]} mcpConnection={mcpConnection} onOpenConnections={() => setModal('model')} />}
+        {active === 'agents' && <AgentsView agents={agentList} logs={agentLogs} account={account} currentEnvironment={environment} loading={agentsLoading} error={agentsError} busyAgentIds={busyAgentIds} busyIntentIds={busyIntentIds} onToggle={toggleAgent} onConfirmIntent={confirmAgentIntent} onRefresh={refreshAgents} onNew={() => setModal('agent')} />}
+        {active === 'strategies' && <StrategiesView onToast={showToast} />}
+        {active === 'skills' && <SkillsView enabled={enabledSkills} onToggle={toggleSkill} onToast={showToast} mcpConnection={mcpConnection} onMcpConnection={setMcpConnection} />}
+        {active === 'connections' && <ConnectionsView environment={environment} binanceConfigured={binanceConfigured} modelConfigured={modelConfigured} modelConfig={modelConfig} proxyUrl={proxyUrl} onExchange={() => setModal('exchange')} onModel={() => setModal('model')} onNetwork={() => setModal('network')} onToast={showToast} />}
+        {active === 'risk' && <RiskView halted={halted} account={account} marketType={marketType} onEmergency={() => setModal('emergency')} onToast={showToast} />}
+        {active === 'orders' && <OrdersView key={`${environment}:${marketType}:${symbol}`} environment={environment} marketType={marketType} symbol={symbol} account={account} onToast={showToast} />}
+        {active === 'review' && <ReviewView onToast={showToast} />}
       </div>
 
-      {modal === 'exchange' && <ExchangeModal onClose={() => setModal(null)} onSaved={() => saveModal('Binance Testnet 连接测试通过')} />}
-      {modal === 'model' && <ModelModal onClose={() => setModal(null)} onSaved={() => saveModal('模型路由连接测试通过')} />}
-      {modal === 'agent' && <AgentModal onClose={() => setModal(null)} onSaved={() => saveModal('Agent 已创建并进入模拟盘观察')} />}
-      {modal === 'emergency' && <Modal title={halted ? '恢复交易执行' : '紧急停止所有执行'} subtitle={halted ? '恢复后 Agent 仍需逐笔通过风控规则' : '此操作会立即拒绝所有新订单，不影响行情监控'} onClose={() => setModal(null)}><div className="emergency-dialog"><AlertOctagon size={28} /><p>{halted ? '确认风控规则和交易所连接均正常后再恢复。已暂停的 Agent 不会自动启动。' : '运行中的 Agent 将切换为只分析模式。已提交的未成交订单需要在交易所侧单独处理。'}</p><div className="modal-actions"><button className="secondary-button" onClick={() => setModal(null)}>取消</button><button className={halted ? 'primary-button' : 'danger-button'} onClick={() => { setHalted(!halted); setModal(null); showToast(halted ? '交易执行已恢复' : '已触发紧急停止，所有新订单将被拒绝') }}>{halted ? '确认恢复' : '确认停止'}</button></div></div></Modal>}
-      {modal === 'notifications' && <Modal title="通知" subtitle="需要处理的系统与 Agent 事件" onClose={() => setModal(null)}><div className="notification-list"><div><span className="notification-icon warning"><AlertOctagon size={16} /></span><div><strong>事件雷达已自动暂停</strong><p>日内回撤达到 2.0% 阈值</p><small>43 分钟前</small></div></div><div><span className="notification-icon"><ShieldCheck size={16} /></span><div><strong>Binance 连接检查通过</strong><p>权限范围符合只读 + 现货交易策略</p><small>2 小时前</small></div></div></div></Modal>}
-
+      {commandOpen && <CommandPalette onClose={() => setCommandOpen(false)} onNavigate={navigate} />}
+      {modal === 'exchange' && <ExchangeModal initialEnvironment={environment} onClose={() => setModal(null)} onSaved={(value) => { setModal(null); setEnvironment(value); setConnectionRevision((revision) => revision + 1); showToast(value === 'paper' ? '模拟盘已启用' : `Binance ${environmentLabel(value)}连接测试通过`) }} />}
+      {modal === 'model' && <ModelModal onClose={() => setModal(null)} onSaved={() => { setModal(null); setConnectionRevision((revision) => revision + 1); showToast('模型路由已保存，可在 AI 助手中发起真实请求') }} />}
+      {modal === 'network' && <NetworkModal initialProxyUrl={proxyUrl} onClose={() => setModal(null)} onSaved={(value, latency) => { setProxyUrl(value); setModal(null); setConnectionRevision((revision) => revision + 1); showToast(`网络出口测试通过 · ${latency} ms · 行情正在重连`) }} />}
+      {modal === 'agent' && <AgentCreateModal initialEnvironment={environment} initialMarketType={marketType} initialSymbol={symbol} onClose={() => setModal(null)} onCreate={createAgent} />}
+      {modal === 'emergency' && <Modal title={halted ? '恢复交易执行' : '紧急停止所有执行'} subtitle={halted ? '恢复后 Agent 仍需逐笔通过风控规则' : '立即拒绝所有新订单，不影响行情监控'} onClose={() => setModal(null)}><div className="emergency-dialog"><AlertOctagon size={28} /><p>{halted ? '确认风控规则和交易所连接均正常后再恢复。已暂停的 Agent 不会自动启动。' : '运行中的 Agent 将切换为只分析模式。已提交的未成交订单需要在交易所侧单独处理。'}</p><div className="modal-actions"><button className="secondary-button" onClick={() => setModal(null)}>取消</button><button className={halted ? 'primary-button' : 'danger-button'} onClick={async () => { const next = !halted; try { await window.atlas?.risk?.setHalted(next); setHalted(next); setModal(null); showToast(next ? '已触发紧急停止，主进程将拒绝所有新订单' : '交易执行已恢复') } catch (caught) { showToast(caught instanceof Error ? caught.message : '风控总闸更新失败') } }}>{halted ? '确认恢复' : '确认停止'}</button></div></div></Modal>}
+      {modal === 'notifications' && <Modal title="通知" subtitle="需要处理的系统与 Agent 事件" onClose={() => setModal(null)}><div className="notification-list"><button onClick={() => { setModal(null); setActive('risk') }}><span className="notification-icon warning"><AlertOctagon size={16} /></span><div><strong>事件雷达已自动暂停</strong><p>日内回撤达到 2.0% 阈值</p><small>43 分钟前</small></div></button><button onClick={() => { setModal(null); setActive('connections') }}><span className="notification-icon"><ShieldCheck size={16} /></span><div><strong>连接状态检查</strong><p>查看交易所与模型路由配置</p><small>现在</small></div></button></div></Modal>}
+      {pendingLiveOrder && <LiveOrderModal order={pendingLiveOrder} onClose={() => setPendingLiveOrder(null)} onConfirm={confirmLiveOrder} />}
       {toast && <div className="toast"><ShieldCheck size={17} /><span>{toast}</span><button onClick={() => setToast(null)} aria-label="关闭"><X size={15} /></button></div>}
     </div>
   )
