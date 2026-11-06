@@ -1,0 +1,67 @@
+{
+  "name": "atlas-agent-os",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Desktop agent operating system for crypto trading",
+  "main": "electron/main.mjs",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "desktop:dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "build": "tsc -b && vite build",
+    "desktop:pack": "npm run build && electron-builder --dir",
+    "desktop:dist": "npm run build && electron-builder",
+    "lint": "eslint .",
+    "preview": "vite preview --host 0.0.0.0"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "lightweight-charts": "latest",
+    "lucide-react": "latest",
+    "vite": "latest",
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {
+    "@eslint/js": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "concurrently": "latest",
+    "cross-env": "latest",
+    "electron": "latest",
+    "electron-builder": "latest",
+    "eslint": "latest",
+    "eslint-plugin-react-hooks": "latest",
+    "eslint-plugin-react-refresh": "latest",
+    "globals": "latest",
+    "typescript": "latest",
+    "typescript-eslint": "latest",
+    "wait-on": "latest"
+  },
+  "build": {
+    "appId": "ai.atlas.agentos",
+    "productName": "Atlas Agent OS",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.finance",
+      "target": ["dmg", "zip"],
+      "artifactName": "Atlas-Agent-OS-${version}-${arch}.${ext}"
+    },
+    "dmg": {
+      "title": "Atlas Agent OS ${version}",
+      "window": { "width": 560, "height": 380 },
+      "contents": [
+        { "x": 160, "y": 185, "type": "file" },
+        { "x": 400, "y": 185, "type": "link", "path": "/Applications" }
+      ]
+    }
+  }
+}
